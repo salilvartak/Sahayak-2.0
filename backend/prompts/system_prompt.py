@@ -111,19 +111,32 @@ def get_safety_message(language_name: str) -> str:
 
 def get_structured_system_prompt(language_name: str) -> str:
     base_prompt = get_system_prompt(language_name)
+
+    # Build a language-appropriate example to avoid the model defaulting to Hindi
+    example_responses = {
+        "Hindi":   "यह पेरासिटामोल दवा है जो बुखार और दर्द में काम आती है।",
+        "Marathi": "हे पेरासिटामोल औषध आहे जे ताप आणि वेदनांसाठी वापरले जाते।",
+        "Telugu":  "ఇది జ్వరం మరియు నొప్పి కోసం ఉపయోగించే పారాసిటమాల్ మాత్ర.",
+        "English": "This is Paracetamol, a medicine used for fever and pain relief.",
+    }
+    example_response = example_responses.get(language_name, example_responses["English"])
+
     return base_prompt + f"""
     
 == OUTPUT FORMAT ==
+CRITICAL: Your "ai_response" field MUST be written in {language_name} ONLY. No other language is allowed.
 You MUST return your response as a JSON object with exactly these fields:
-1. "ai_response": Your spoken response in {language_name} only, using native script (Devanagari for Hindi/Marathi, Telugu script for Telugu).
+1. "ai_response": Your spoken response in {language_name} only.
 2. "memory": A dictionary with:
-    - "entities": A list of up to 5 important entities found (e.g. [{{"name": "...", "type": "..."}}]).
-    - "intent": The user's main goal (1-3 words).
-    - "topic": The core subject (1-2 words).
+    - "entities": A list of up to 5 important entities found in ENGLISH script only (e.g. [{{"name": "Paracetamol", "type": "Medicine"}}]).
+    - "intent": The user's main goal in ENGLISH (1-3 words).
+    - "topic": The core subject in ENGLISH (1-2 words).
+    
+CRITICAL: Use ONLY English for the "memory" fields, but use {language_name} for the "ai_response".
 
-Example:
+Example for {language_name}:
 {{
-  "ai_response": "नमस्ते! यह एक दवा है...",
+  "ai_response": "{example_response}",
   "memory": {{
     "entities": [{{"name": "Paracetamol", "type": "Medicine"}}],
     "intent": "identify medicine",

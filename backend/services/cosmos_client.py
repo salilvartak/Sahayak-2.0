@@ -106,4 +106,22 @@ class CosmosClientService:
             print(f"Failed to query session history: {ex.message}")
             return []
 
+    async def get_last_interaction_id(self, session_id: str):
+        """Retrieve the most recent interaction ID for a session."""
+        if self.container is None:
+            await self.init()
+
+        try:
+            # Query the latest interaction for this session
+            query = "SELECT TOP 1 c.id FROM c WHERE c.session_id = @session_id ORDER BY c.timestamp DESC"
+            items = list(self.container.query_items(
+                query=query,
+                parameters=[{"name": "@session_id", "value": session_id}],
+                enable_cross_partition_query=True
+            ))
+            return items[0]["id"] if items else None
+        except exceptions.CosmosHttpResponseError as ex:
+            print(f"Failed to query last interaction ID: {ex.message}")
+            return None
+
 cosmos_client = CosmosClientService()

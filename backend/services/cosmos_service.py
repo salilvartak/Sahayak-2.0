@@ -68,9 +68,10 @@ class CosmosService:
         }
 
         try:
+            def _safe(s): return s.encode('ascii', errors='replace').decode('ascii')
             print(f"DEBUG: Saving to Cosmos for {device_id}")
-            print(f"  Query: {query[:100]}...")
-            print(f"  Response: {response[:100]}...")
+            print(f"  Query: {_safe(query[:100])}...")
+            print(f"  Response: {_safe(response[:100])}...")
             self.container.upsert_item(interaction_doc)
             print(f"Interaction {interaction_id} saved to Cosmos DB.")
         except exceptions.CosmosHttpResponseError as ex:

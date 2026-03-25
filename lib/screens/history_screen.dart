@@ -4,9 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 import '../providers/conversation_provider.dart';
-import '../providers/language_provider.dart';
 import '../providers/settings_provider.dart';
 import '../models/conversation_turn.dart';
+import '../models/language.dart';
 
 class HistoryScreen extends ConsumerWidget {
   const HistoryScreen({super.key});
@@ -15,8 +15,7 @@ class HistoryScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(conversationProvider);
     final history = state.history;
-    final languageState = ref.watch(languageProvider);
-    final language = languageState.language;
+    const language = Language.english;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -90,7 +89,7 @@ class _HistoryCard extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final settings = ref.watch(settingsProvider);
-    final languageState = ref.watch(languageProvider);
+    const language = Language.english;
     final dateStr = DateFormat('MMM d, h:mm a').format(turn.timestamp);
 
     final bool isNetworkImage = turn.imagePath?.startsWith('http') ?? false;
@@ -169,7 +168,7 @@ class _HistoryCard extends ConsumerWidget {
                     ),
                     _AudioButton(
                       text: turn.query, 
-                      language: languageState.language, 
+                      language: language, 
                       isUser: true
                     ),
                   ],
@@ -201,7 +200,7 @@ class _HistoryCard extends ConsumerWidget {
                         alignment: Alignment.bottomRight,
                         child: _AudioButton(
                           text: turn.response, 
-                          language: languageState.language, 
+                          language: language, 
                           isUser: false
                         ),
                       ),

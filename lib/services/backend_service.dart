@@ -21,7 +21,15 @@ class BackendService {
 
     request.fields['device_id'] = deviceId;
     request.fields['query'] = query;
-    request.fields['language'] = language.name; // "hindi", "marathi" etc. (Lowercase since it's enum.name in older Dart, but let's check)
+    // language.name = lowercase enum name (e.g. 'hindi', 'marathi', 'english')
+    // backend capitalizes it to match system_prompt keys
+    request.fields['language'] = language.name;
+
+    debugPrint('📤 [Backend] Sending request to $uri');
+    debugPrint('📤 [Backend] device_id : $deviceId');
+    debugPrint('📤 [Backend] language  : ${language.name}');
+    debugPrint('📤 [Backend] query     : "$query"');
+    debugPrint('📤 [Backend] has image : ${imageFile != null}');
 
     if (imageFile != null) {
       request.files.add(await http.MultipartFile.fromPath(
@@ -36,9 +44,11 @@ class BackendService {
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
-        return (data['response'] as String).trim();
+        final responseText = (data['response'] as String).trim();
+        debugPrint('📥 [Backend] Response: "$responseText"');
+        return responseText;
       } else {
-        debugPrint('Backend error ${response.statusCode}: ${response.body}');
+        debugPrint('❌ [Backend] Error ${response.statusCode}: ${response.body}');
         throw Exception('Backend error (${response.statusCode})');
       }
     } catch (e) {

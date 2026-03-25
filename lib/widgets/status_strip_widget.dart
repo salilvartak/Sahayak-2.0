@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/conversation_provider.dart';
-import '../providers/language_provider.dart';
+import '../models/language.dart';
 import '../localization/app_localizations.dart';
 
 
@@ -11,8 +11,8 @@ class StatusStripWidget extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final status = ref.watch(conversationProvider).status;
-    final languageState = ref.watch(languageProvider);
-    final localizations = AppLocalizations(languageState.language);
+    const language = Language.english;
+    final localizations = AppLocalizations(language);
 
     String statusText = '';
     switch (status) {

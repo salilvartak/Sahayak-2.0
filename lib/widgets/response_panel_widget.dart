@@ -2,8 +2,8 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/conversation_provider.dart';
-import '../providers/language_provider.dart';
 import '../providers/settings_provider.dart';
+import '../models/language.dart';
 import '../localization/app_localizations.dart';
 
 class ResponsePanelWidget extends ConsumerWidget {
@@ -14,9 +14,9 @@ class ResponsePanelWidget extends ConsumerWidget {
     final state = ref.watch(conversationProvider);
     final response = state.lastResponse;
     final status = state.status;
-    final languageState = ref.watch(languageProvider);
+    const language = Language.english;
     final settings = ref.watch(settingsProvider);
-    final localizations = AppLocalizations(languageState.language);
+    final localizations = AppLocalizations(language);
 
     if (response.isEmpty || status == AppState.listening) return const SizedBox.shrink();
 

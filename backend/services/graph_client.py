@@ -77,25 +77,33 @@ class GraphClient:
         SET i.text = $text, i.timestamp = datetime()
         MERGE (s)-[:HAS_INTERACTION]->(i)
         
-        // 2. Intent & Topic
-        FOREACH (_ IN CASE WHEN $intent <> "" THEN [1] ELSE [] END |
+        // 2. Intent
+        WITH i
+        CALL (i) {
+          WITH i WHERE $intent <> ""
           MERGE (intent:Intent {name: $intent})
           MERGE (i)-[:HAS_INTENT]->(intent)
-        )
-        FOREACH (_ IN CASE WHEN $topic <> "" THEN [1] ELSE [] END |
+        }
+        
+        // 3. Topic & User Interest
+        WITH i
+        CALL (i) {
+          WITH i WHERE $topic <> ""
           MERGE (topic:Topic {name: $topic})
           MERGE (i)-[:RELATES_TO]->(topic)
-          // Also link user interest directly
-          WITH i, topic
+          WITH topic
           MATCH (u:User)-[:HAS_SESSION]->(:Session)-[:HAS_INTERACTION]->(i)
           MERGE (u)-[:INTERESTED_IN]->(topic)
-        )
+        }
         
-        // 3. Sequential connection
-        FOREACH (_ IN CASE WHEN $prev_id <> "" AND $prev_id IS NOT NULL THEN [1] ELSE [] END |
+        // 4. Sequential connection
+        WITH i
+        CALL (i) {
+          WITH i WHERE $prev_id <> "" AND $prev_id IS NOT NULL
+          // Reference the previous interaction if it exists
           MERGE (prev:Interaction {id: $prev_id})
           MERGE (i)-[:FOLLOWS]->(prev)
-        )
+        }
         
         RETURN i
         """

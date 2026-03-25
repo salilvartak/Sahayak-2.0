@@ -1,9 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'providers/settings_provider.dart';
-import 'providers/language_provider.dart';
-import 'screens/language_selection_screen.dart';
-import 'screens/main_screen.dart';
 import 'screens/main_screen.dart';
 import 'screens/history_screen.dart';
 
@@ -13,9 +10,8 @@ class SahayakApp extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final settings = ref.watch(settingsProvider);
-    final languageState = ref.watch(languageProvider);
 
-    final bool isAppLoading = settings.isLoading || languageState.isLoading;
+    final bool isAppLoading = settings.isLoading;
 
     return MaterialApp(
       title: 'Sahayak',
@@ -30,9 +26,8 @@ class SahayakApp extends ConsumerWidget {
       debugShowCheckedModeBanner: false,
       home: isAppLoading 
           ? const Scaffold(body: Center(child: CircularProgressIndicator()))
-          : (settings.isFirstLaunch ? const LanguageSelectionScreen() : const MainScreen()),
+          : const MainScreen(),
       routes: {
-        '/language_selection': (context) => const LanguageSelectionScreen(),
         '/main': (context) => const MainScreen(),
         '/history': (context) => const HistoryScreen(),
       },

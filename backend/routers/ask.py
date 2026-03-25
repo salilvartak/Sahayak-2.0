@@ -2,6 +2,7 @@ import uuid
 from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks, HTTPException
 from services.agent import agent_graph
 from services.blob_service import blob_service
+from services.cosmos_client import cosmos_client
 from models.schemas import AskResponse
 
 router = APIRouter()
@@ -37,6 +38,9 @@ async def ask(
             raise HTTPException(status_code=400, detail="Could not read image file")
             
     try:
+        # 0. Get the previous interaction ID for this session to maintain history chain
+        prev_interaction_id = await cosmos_client.get_last_interaction_id(session_id)
+        
         # Prepare state for LangGraph pipeline
         state = {
             "user_id": device_id,
@@ -47,8 +51,9 @@ async def ask(
             "image_bytes": image_bytes,
             "blob_name": blob_name,
             "metadata": {"user_id": device_id},
-            "prev_interaction_id": None
+            "prev_interaction_id": prev_interaction_id
         }
+        print(f"[ask] query='{query}' | language='{language}' | image={'yes' if image_bytes else 'no'} ({len(image_bytes) if image_bytes else 0} bytes)", flush=True)
 
         # 1. OPTIMIZATION: Get LLM response directly to avoid pipeline overhead
         # Import inside for now or at top

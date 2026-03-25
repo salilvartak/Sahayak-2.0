@@ -1,9 +1,9 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../providers/language_provider.dart';
 import '../providers/settings_provider.dart';
 import '../localization/app_localizations.dart';
+import '../models/language.dart';
 
 class SettingsScreen extends ConsumerWidget {
   const SettingsScreen({super.key});
@@ -11,8 +11,8 @@ class SettingsScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final settings = ref.watch(settingsProvider);
-    final languageState = ref.watch(languageProvider);
-    final localizations = AppLocalizations(languageState.language);
+    const language = Language.english;
+    final localizations = AppLocalizations(language);
     final settingsNotifier = ref.read(settingsProvider.notifier);
 
     return Scaffold(
@@ -60,15 +60,7 @@ class SettingsScreen extends ConsumerWidget {
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
               physics: const BouncingScrollPhysics(),
               children: [
-                // Language Tile
-                _SettingsGlassTile(
-                  title: localizations.translate('change_language'),
-                  subtitle: languageState.language.nativeName,
-                  icon: Icons.language_rounded,
-                  onTap: () => Navigator.pushNamed(context, '/language_selection'),
-                ),
-
-                const SizedBox(height: 32),
+                const SizedBox(height: 12),
 
                 // Text Size Selection
                 _GlassControlGroup(

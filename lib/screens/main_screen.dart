@@ -2,7 +2,6 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/conversation_provider.dart';
-import '../providers/language_provider.dart';
 import '../widgets/camera_preview_widget.dart';
 import '../widgets/control_bar_widget.dart';
 import '../widgets/response_panel_widget.dart';
@@ -28,7 +27,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
   final GlobalKey _flashKey = GlobalKey();
   final GlobalKey _orbKey = GlobalKey();
   final GlobalKey _historyKey = GlobalKey();
-  final GlobalKey _languageKey = GlobalKey();
+  final TextEditingController _textController = TextEditingController();
+  bool _isSilentMode = false;
 
   TutorialCoachMark? _tutorialCoachMark;
 
@@ -50,13 +50,13 @@ class _MainScreenState extends ConsumerState<MainScreen>
   }
 
   void _showTutorial() {
-    final language = ref.read(languageProvider).language;
+    const language = Language.english;
     final localizations = AppLocalizations(language);
     final tts = ref.read(ttsServiceProvider);
     final settings = ref.read(settingsProvider);
     tts.setSpeed(settings.voiceSpeed);
 
-    final List<String> stepIds = ['welcome', 'mic', 'camera', 'flash', 'orb', 'history', 'language'];
+    final List<String> stepIds = ['welcome', 'mic', 'camera', 'flash', 'orb', 'history'];
 
     void speakTutorial(String titleKey, String descKey, String identify) {
       final title = localizations.translate(titleKey);
@@ -156,20 +156,6 @@ class _MainScreenState extends ConsumerState<MainScreen>
           ),
         ],
       ),
-      TargetFocus(
-        identify: "language",
-        keyTarget: _languageKey,
-        contents: [
-          TargetContent(
-            align: ContentAlign.bottom,
-            builder: (context, controller) => _buildTutorialStepContent(
-              controller,
-              localizations,
-              isLast: true,
-            ),
-          ),
-        ],
-      ),
     ];
 
     _tutorialCoachMark = TutorialCoachMark(
@@ -182,7 +168,6 @@ class _MainScreenState extends ConsumerState<MainScreen>
           'flash': ['tutorial_flash_title', 'tutorial_flash_desc'],
           'orb': ['tutorial_orb_title', 'tutorial_orb_desc'],
           'history': ['tutorial_history_title', 'tutorial_history_desc'],
-          'language': ['tutorial_language_title', 'tutorial_language_desc'],
         };
         final keys = tutorialKeysMap[target.identify];
         if (keys != null) {
@@ -261,6 +246,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
   @override
   void dispose() {
+    _textController.dispose();
     super.dispose();
   }
 
@@ -336,6 +322,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
                   children: [
                     const ResponsePanelWidget(),
                     const SizedBox(height: 12),
+                    if (_isSilentMode) _buildSilentInputArea(),
                     ControlBarWidget(
                       micKey: _micKey,
                       cameraKey: _cameraKey,
@@ -351,9 +338,52 @@ class _MainScreenState extends ConsumerState<MainScreen>
     );
   }
 
+  Widget _buildSilentInputArea() {
+    const language = Language.english;
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(30),
+        border: Border.all(color: Colors.white.withOpacity(0.12)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _textController,
+              style: const TextStyle(color: Colors.white, fontSize: 16),
+              decoration: const InputDecoration(
+                hintText: 'Type your message...',
+                hintStyle: TextStyle(color: Colors.white30, fontSize: 16),
+                border: InputBorder.none,
+              ),
+              onSubmitted: (_) => _handleSilentSubmit(language),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.camera_alt_rounded, color: Color(0xFF6C8EFF)),
+            onPressed: () => _handleSilentSubmit(language),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _handleSilentSubmit(Language language) {
+    if (_textController.text.trim().isEmpty) return;
+    ref.read(conversationProvider.notifier).processTextQuery(
+      _textController.text.trim(),
+      language,
+    );
+    _textController.clear();
+    // Keep silent mode on, but the provider will update the status to thinking
+  }
+
   PreferredSizeWidget _buildAppBar(BuildContext context) {
-    final languageState = ref.watch(languageProvider);
-    final localizations = AppLocalizations(languageState.language);
+    const language = Language.english;
+    final localizations = AppLocalizations(language);
 
     return AppBar(
       automaticallyImplyLeading: false,
@@ -390,6 +420,27 @@ class _MainScreenState extends ConsumerState<MainScreen>
       ),
       actions: [
         GestureDetector(
+          onTap: () {
+            setState(() {
+              _isSilentMode = !_isSilentMode;
+            });
+          },
+          child: Container(
+            margin: const EdgeInsets.only(right: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(20),
+              color: _isSilentMode ? const Color(0xFF6C8EFF).withOpacity(0.15) : Colors.white.withOpacity(0.08),
+              border: Border.all(color: _isSilentMode ? const Color(0xFF6C8EFF).withOpacity(0.4) : Colors.white.withOpacity(0.12)),
+            ),
+            child: Icon(
+              _isSilentMode ? Icons.keyboard_rounded : Icons.keyboard_hide_rounded, 
+              color: _isSilentMode ? const Color(0xFF6C8EFF) : Colors.white70, 
+              size: 18
+            ),
+          ),
+        ),
+        GestureDetector(
           onTap: () => Navigator.pushNamed(context, '/history'),
           child: Container(
             key: _historyKey,
@@ -401,20 +452,6 @@ class _MainScreenState extends ConsumerState<MainScreen>
               border: Border.all(color: Colors.white.withOpacity(0.12)),
             ),
             child: const Icon(Icons.history_rounded, color: Colors.white70, size: 18),
-          ),
-        ),
-        GestureDetector(
-          onTap: () => Navigator.pushNamed(context, '/language_selection'),
-          child: Container(
-            key: _languageKey,
-            margin: const EdgeInsets.only(right: 16),
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(20),
-              color: Colors.white.withOpacity(0.08),
-              border: Border.all(color: Colors.white.withOpacity(0.12)),
-            ),
-            child: const Icon(Icons.language_rounded, color: Colors.white70, size: 18),
           ),
         ),
       ],
@@ -544,13 +581,13 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
 
   @override
   Widget build(BuildContext context) {
-    final languageState = ref.watch(languageProvider);
     final status = ref.watch(conversationProvider).status;
     final bool isListening = status == AppState.listening;
     final bool isThinking = status == AppState.thinking;
     final bool isSpeaking = status == AppState.speaking;
     final bool isActive = isListening || isThinking || isSpeaking;
-    final localizations = AppLocalizations(languageState.language);
+    const language = Language.english;
+    final localizations = AppLocalizations(language);
 
     return Column(
       mainAxisSize: MainAxisSize.min,

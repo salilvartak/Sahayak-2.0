@@ -2,7 +2,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/conversation_provider.dart';
-import '../providers/language_provider.dart';
+import '../models/language.dart';
 import '../localization/app_localizations.dart';
 
 class CameraPreviewWidget extends ConsumerStatefulWidget {
@@ -35,8 +35,8 @@ class _CameraPreviewWidgetState extends ConsumerState<CameraPreviewWidget> with 
     final state = ref.watch(conversationProvider);
     final conversation = ref.read(conversationProvider.notifier);
     final controller = conversation.cameraService.controller;
-    final languageState = ref.watch(languageProvider);
-    final localizations = AppLocalizations(languageState.language);
+    const language = Language.english;
+    final localizations = AppLocalizations(language);
 
     if (controller == null || !controller.value.isInitialized) {
       return const Center(child: CircularProgressIndicator(color: Colors.white));

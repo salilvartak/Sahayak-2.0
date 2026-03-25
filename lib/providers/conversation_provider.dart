@@ -3,21 +3,19 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/conversation_turn.dart';
 import '../services/camera_service.dart';
-import '../services/gemini_service.dart';
-import '../services/stt_service.dart';
 import '../services/tts_service.dart';
 import '../utils/image_utils.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../models/language.dart';
-import 'language_provider.dart';
 import 'settings_provider.dart';
 import '../localization/app_localizations.dart';
-
-import 'package:path_provider/path_provider.dart';
-import 'package:path/path.dart' as p;
 import '../services/history_service.dart';
 import '../services/backend_service.dart';
+import '../services/azure_speech_service.dart';
+import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
 
 enum AppState { idle, listening, thinking, speaking, error }
 
@@ -56,11 +54,14 @@ final conversationProvider = StateNotifierProvider<ConversationNotifier, Convers
 class ConversationNotifier extends StateNotifier<ConversationState> {
   final Ref _ref;
   final CameraService _cameraService = CameraService();
-  final STTService _sttService = STTService();
+  final AudioRecorder _recorder = AudioRecorder();
+  final AzureSpeechService _azureSpeechService = AzureSpeechService();
   final TTSService _ttsService = TTSService();
-  final GeminiService _geminiService = GeminiService();
   final HistoryService _historyService = HistoryService();
   final BackendService _backendService = BackendService();
+
+  String? _recordingPath;
+  Language _detectedLanguage = Language.english;
 
   ConversationNotifier(this._ref) : super(ConversationState());
 
@@ -87,8 +88,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
 
       if (!cameraStatus.isGranted || !micStatus.isGranted) {
         state = state.copyWith(status: AppState.error);
-        final languageState = _ref.read(languageProvider);
-        final language = languageState.language;
+        const language = Language.english;
         final localizations = AppLocalizations(language);
         await _ttsService.speak(localizations.translate('permission_error'), language);
         return;
@@ -101,20 +101,16 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       } catch (e) {
         debugPrint('Camera initialization failed: $e');
         state = state.copyWith(status: AppState.error);
-        final languageState = _ref.read(languageProvider);
-        final language = languageState.language;
+        const language = Language.english;
         final localizations = AppLocalizations(language);
         await _ttsService.speak(localizations.translate('camera_error'), language);
         return;
       }
-
-      await _sttService.initialize();
       
       // Welcome message - only if tutorial is already done
       final settings = _ref.read(settingsProvider);
       if (settings.tutorialCompleted) {
-        final languageState = _ref.read(languageProvider);
-        final language = languageState.language;
+        const language = Language.english;
         final localizations = AppLocalizations(language);
         await _ttsService.speak(localizations.translate('welcome_message'), language);
       }
@@ -131,16 +127,77 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
     await _ttsService.speak(text, language);
   }
 
-  void startListening() {
-    final languageState = _ref.read(languageProvider);
-    state = state.copyWith(status: AppState.listening);
-    _sttService.startListening(languageState.language, (result) {
-      // Periodic results if needed
-    });
+  Future<void> startListening() async {
+    try {
+      if (await _recorder.hasPermission()) {
+        final directory = await getTemporaryDirectory();
+        _recordingPath = p.join(directory.path, 'audio_capture.wav');
+        
+        state = state.copyWith(status: AppState.listening);
+        
+        await _recorder.start(
+          const RecordConfig(
+            encoder: AudioEncoder.wav,
+            sampleRate: 16000,
+            numChannels: 1,
+          ),
+          path: _recordingPath!,
+        );
+      }
+    } catch (e) {
+      debugPrint('Recording Start Error: $e');
+      state = state.copyWith(status: AppState.error);
+    }
+  }
+
+  Future<void> processTextQuery(String query, Language language) async {
+    state = state.copyWith(status: AppState.thinking);
+    
+    try {
+      final xFile = await _cameraService.captureFrame();
+      if (xFile == null) throw Exception('Camera capture failed');
+      
+      final compressedFile = await ImageUtils.compressImage(xFile.path);
+      final deviceId = await _getDeviceId();
+      
+      final String response = await _backendService.getResponse(
+        deviceId: deviceId,
+        query: query,
+        imageFile: File(compressedFile.path),
+        language: language,
+      );
+
+      final newTurn = ConversationTurn(
+        query: query,
+        response: response,
+        timestamp: DateTime.now(),
+        imagePath: null,
+      );
+
+      final newHistory = [newTurn, ...state.history];
+
+      state = state.copyWith(
+        status: AppState.speaking,
+        lastResponse: response,
+        history: newHistory,
+      );
+
+      final settings = _ref.read(settingsProvider);
+      _ttsService.setSpeed(settings.voiceSpeed);
+      await _ttsService.speak(response, language);
+      
+      state = state.copyWith(status: AppState.idle);
+    } catch (e) {
+      debugPrint('Error in processTextQuery: $e');
+      state = state.copyWith(status: AppState.error);
+      Future.delayed(const Duration(seconds: 4), () {
+        if (mounted) state = state.copyWith(status: AppState.idle);
+      });
+    }
   }
 
   Future<void> stopListeningAndProcess() async {
-    await _sttService.stopListening();
+    final String? path = await _recorder.stop();
     
     state = state.copyWith(status: AppState.thinking);
     
@@ -150,18 +207,19 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       
       final compressedFile = await ImageUtils.compressImage(xFile.path);
       
-      final String transcript = _sttService.lastRecognizedWords.isNotEmpty 
-          ? _sttService.lastRecognizedWords 
-          : 'What is this?';
+      // Send to Azure
+      final result = await _azureSpeechService.recognize(path!);
+      final transcript = result.transcript.isNotEmpty ? result.transcript : 'What is this?';
+      _detectedLanguage = _mapAzureLanguage(result.language);
       
       final deviceId = await _getDeviceId();
       
-      // Only use backend, no fallback
+      // Use detected language
       final String response = await _backendService.getResponse(
         deviceId: deviceId,
         query: transcript,
         imageFile: File(compressedFile.path),
-        language: _ref.read(languageProvider).language,
+        language: _detectedLanguage,
       );
 
       final newTurn = ConversationTurn(
@@ -180,9 +238,8 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       );
 
       final settings = _ref.read(settingsProvider);
-      final languageState = _ref.read(languageProvider);
       _ttsService.setSpeed(settings.voiceSpeed);
-      await _ttsService.speak(response, languageState.language);
+      await _ttsService.speak(response, _detectedLanguage);
       
       state = state.copyWith(status: AppState.idle);
     } catch (e, stackTrace) {
@@ -190,8 +247,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       debugPrint('Stack trace: $stackTrace');
       
       state = state.copyWith(status: AppState.error);
-      final languageState = _ref.read(languageProvider);
-      final language = languageState.language;
+      const language = Language.english;
       final localizations = AppLocalizations(language);
       
       String errorKey = 'connection_error';
@@ -271,9 +327,17 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
     return id;
   }
 
+  Language _mapAzureLanguage(String azureCode) {
+    if (azureCode.toLowerCase().contains('hi')) return Language.hindi;
+    if (azureCode.toLowerCase().contains('mr')) return Language.marathi;
+    if (azureCode.toLowerCase().contains('te')) return Language.telugu;
+    return Language.english;
+  }
+
   @override
   void dispose() {
     _cameraService.dispose();
+    _recorder.dispose();
     super.dispose();
   }
 }
