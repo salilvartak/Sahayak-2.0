@@ -531,7 +531,7 @@ class _TutorialBotIcon extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Voice Orb — the premium centrepiece
+// Voice Orb — PART 11: state visualisation, no user interaction
 // ---------------------------------------------------------------------------
 
 class VoiceOrbWidget extends ConsumerStatefulWidget {
@@ -545,8 +545,10 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
     with TickerProviderStateMixin {
   late AnimationController _pulseController;
   late AnimationController _rotateController;
-  late AnimationController _waveController;
+
   late Animation<double> _pulseAnim;
+
+  AppVoiceState _lastStatus = AppVoiceState.idle;
 
   @override
   void initState() {
@@ -561,71 +563,101 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
       duration: const Duration(seconds: 12),
     )..repeat();
 
-    _waveController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    )..repeat(reverse: true);
-
     _pulseAnim = Tween<double>(begin: 0.92, end: 1.08).animate(
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
+  }
+
+  /// Adjust ring rotation speed based on pipeline state
+  void _updateRotationSpeed(AppVoiceState status) {
+    if (status == _lastStatus) return;
+    _lastStatus = status;
+
+    final Duration dur;
+    switch (status) {
+      case AppVoiceState.interrupted:
+        dur = const Duration(milliseconds: 600);
+        break;
+      case AppVoiceState.streaming:
+      case AppVoiceState.speaking:
+        dur = const Duration(seconds: 4);
+        break;
+      case AppVoiceState.thinking:
+      case AppVoiceState.transcribing:
+        dur = const Duration(seconds: 6);
+        break;
+      case AppVoiceState.capturing:
+        dur = const Duration(seconds: 8);
+        break;
+      default:
+        dur = const Duration(seconds: 12);
+    }
+    _rotateController.duration = dur;
+    if (_rotateController.isAnimating) _rotateController.repeat();
   }
 
   @override
   void dispose() {
     _pulseController.dispose();
     _rotateController.dispose();
-    _waveController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final status = ref.watch(conversationProvider).status;
-    final bool isListening = status == AppState.listening;
-    final bool isThinking = status == AppState.thinking;
-    final bool isSpeaking = status == AppState.speaking;
-    final bool isActive = isListening || isThinking || isSpeaking;
+    _updateRotationSpeed(status);
+
+    final bool isActive = status != AppVoiceState.idle;
     const language = Language.english;
     final localizations = AppLocalizations(language);
+    final color = _orbColor(status);
 
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        // --- Outer ring glow when active ---
+        // --- Rotating ring + optional inner content ---
         AnimatedContainer(
-          duration: const Duration(milliseconds: 600),
+          duration: const Duration(milliseconds: 500),
           curve: Curves.easeOut,
           width: isActive ? 220 : 0,
           height: isActive ? 220 : 0,
           child: isActive
-              ? AnimatedBuilder(
-                  animation: _rotateController,
-                  builder: (_, __) => Transform.rotate(
-                    angle: _rotateController.value * 2 * math.pi,
-                    child: CustomPaint(
-                      painter: _ArcRingPainter(
-                        color: _orbColor(status),
-                        progress: _pulseController.value,
+              ? Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    // Rotating arc ring
+                    AnimatedBuilder(
+                      animation: _rotateController,
+                      builder: (ctx, _) => Transform.rotate(
+                        angle: _rotateController.value * 2 * math.pi,
+                        child: CustomPaint(
+                          size: const Size(220, 220),
+                          painter: _ArcRingPainter(
+                            color: color,
+                            progress: _pulseController.value,
+                          ),
+                        ),
                       ),
                     ),
-                  ),
+                    // Inner content varies by state
+                    _buildInnerContent(status, color),
+                  ],
                 )
               : const SizedBox.shrink(),
         ),
 
-        if (isActive) const SizedBox(height: 0)
-        else const SizedBox(height: 220),
+        if (!isActive) const SizedBox(height: 220),
 
         // --- Status label ---
         AnimatedSwitcher(
-          duration: const Duration(milliseconds: 400),
+          duration: const Duration(milliseconds: 350),
           child: isActive
               ? Text(
                   _statusLabel(status, localizations),
                   key: ValueKey(status),
                   style: TextStyle(
-                    color: Colors.white.withOpacity(0.75),
+                    color: Colors.white.withValues(alpha: 0.75),
                     fontSize: 13,
                     fontWeight: FontWeight.w300,
                     letterSpacing: 5,
@@ -637,28 +669,82 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
     );
   }
 
-  Color _orbColor(AppState? status) {
+  /// Central content inside the ring — changes per pipeline state
+  Widget _buildInnerContent(AppVoiceState status, Color color) {
     switch (status) {
-      case AppState.listening:
-        return const Color(0xFF6C8EFF);
-      case AppState.thinking:
-        return const Color(0xFFB06EFB);
-      case AppState.speaking:
-        return const Color(0xFF5ECFB1);
+      case AppVoiceState.capturing:
+        // Waveform bars while audio is being captured
+        return const SizedBox(
+          width: 80,
+          child: WaveformVisualizer(),
+        );
+      case AppVoiceState.thinking:
+      case AppVoiceState.transcribing:
+        // Spinning loader while LLM processes
+        return SizedBox(
+          width: 36,
+          height: 36,
+          child: CircularProgressIndicator(
+            strokeWidth: 1.5,
+            valueColor: AlwaysStoppedAnimation<Color>(color),
+          ),
+        );
+      case AppVoiceState.interrupted:
+        // Flash indicator — bold bolt icon
+        return AnimatedBuilder(
+          animation: _pulseController,
+          builder: (bCtx, _) => Icon(
+            Icons.bolt_rounded,
+            color: color.withValues(
+                alpha: 0.5 + _pulseController.value * 0.5),
+            size: 48,
+          ),
+        );
       default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  Color _orbColor(AppVoiceState status) {
+    switch (status) {
+      case AppVoiceState.listening:
+        return const Color(0xFF6C8EFF);
+      case AppVoiceState.capturing:
+        return const Color(0xFF6C8EFF);
+      case AppVoiceState.transcribing:
+        return const Color(0xFFB06EFB);
+      case AppVoiceState.thinking:
+        return const Color(0xFFB06EFB);
+      case AppVoiceState.streaming:
+      case AppVoiceState.speaking:
+        return const Color(0xFF5ECFB1);
+      case AppVoiceState.interrupted:
+        return Colors.orange;
+      case AppVoiceState.error:
+        return Colors.redAccent;
+      case AppVoiceState.idle:
         return Colors.white24;
     }
   }
 
-  String _statusLabel(AppState? status, AppLocalizations localizations) {
+  String _statusLabel(AppVoiceState status, AppLocalizations localizations) {
     switch (status) {
-      case AppState.listening:
+      case AppVoiceState.listening:
         return localizations.translate('listening').toUpperCase();
-      case AppState.thinking:
+      case AppVoiceState.capturing:
+        return 'CAPTURING';
+      case AppVoiceState.transcribing:
+        return 'TRANSCRIBING';
+      case AppVoiceState.thinking:
         return localizations.translate('thinking').toUpperCase();
-      case AppState.speaking:
+      case AppVoiceState.streaming:
+      case AppVoiceState.speaking:
         return localizations.translate('speaking').toUpperCase();
-      default:
+      case AppVoiceState.interrupted:
+        return 'INTERRUPTED';
+      case AppVoiceState.error:
+        return 'ERROR';
+      case AppVoiceState.idle:
         return '';
     }
   }
@@ -677,20 +763,19 @@ class _ArcRingPainter extends CustomPainter {
     final radius = size.width / 2 - 8;
 
     final paint = Paint()
-      ..color = color.withOpacity(0.5 + progress * 0.3)
       ..strokeWidth = 1.2
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
-    // Three arcs at different offsets
     for (int i = 0; i < 3; i++) {
-      final startAngle = (i * (2 * math.pi / 3));
+      final startAngle = i * (2 * math.pi / 3);
+      final opacity = (0.5 - i * 0.12).clamp(0.0, 1.0);
       canvas.drawArc(
         Rect.fromCircle(center: center, radius: radius - i * 8),
         startAngle,
         math.pi * 0.6,
         false,
-        paint..color = color.withOpacity((0.5 - i * 0.12).clamp(0, 1)),
+        paint..color = color.withValues(alpha: opacity),
       );
     }
 
@@ -699,13 +784,14 @@ class _ArcRingPainter extends CustomPainter {
       center,
       4 + progress * 3,
       Paint()
-        ..color = color.withOpacity(0.9)
+        ..color = color.withValues(alpha: 0.9)
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6),
     );
   }
 
   @override
-  bool shouldRepaint(_ArcRingPainter old) => old.progress != progress || old.color != color;
+  bool shouldRepaint(_ArcRingPainter old) =>
+      old.progress != progress || old.color != color;
 }
 
 // ---------------------------------------------------------------------------

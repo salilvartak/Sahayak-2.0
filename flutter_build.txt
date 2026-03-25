@@ -1,0 +1,24 @@
+Running Gradle task 'assembleRelease'...                        
+lib/widgets/control_bar_widget.dart:54:55: Error: The method 'stopListeningAndProcess' isn't defined for the type 'ConversationNotifier'.
+ - 'ConversationNotifier' is from 'package:sahayak/providers/conversation_provider.dart' ('lib/providers/conversation_provider.dart').
+Try correcting the name to the name of an existing method, or defining a method named 'stopListeningAndProcess'.
+              ref.read(conversationProvider.notifier).stopListeningAndProcess();
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^
+Target kernel_snapshot_program failed: Exception
+
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:compileFlutterBuildRelease'.
+> Process 'command 'C:\src\flutter\bin\flutter.bat'' finished with non-zero exit value 1
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights.
+> Get more help at https://help.gradle.org.
+
+BUILD FAILED in 11s
+Running Gradle task 'assembleRelease'...                           11.9s
+Gradle task assembleRelease failed with exit code 1

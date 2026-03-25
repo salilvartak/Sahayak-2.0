@@ -18,7 +18,7 @@ class ResponsePanelWidget extends ConsumerWidget {
     final settings = ref.watch(settingsProvider);
     final localizations = AppLocalizations(language);
 
-    if (response.isEmpty || status == AppState.listening) return const SizedBox.shrink();
+    if (response.isEmpty || status == AppVoiceState.listening) return const SizedBox.shrink();
 
     return Padding(
       padding: const EdgeInsets.only(left: 20, right: 20, bottom: 20),

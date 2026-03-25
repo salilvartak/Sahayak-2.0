@@ -2,7 +2,8 @@ from typing import TypedDict, Annotated, List, Optional
 import json
 import uuid
 from langgraph.graph import StateGraph, END
-from services.gemini_service import gemini_service
+from services.router_service import router_service
+from services.azure_ai_service import azure_ai_service
 from services.cosmos_client import cosmos_client
 from services.memory_pipeline import memory_pipeline
 from services.graph_client import graph_client
@@ -16,37 +17,56 @@ class AgentState(TypedDict):
     language: str
     image_bytes: Optional[bytes]
     response_text: str
-    extracted_memory: Optional[dict]  # Newly added field
+    extracted_memory: Optional[dict]
     metadata: dict
     prev_interaction_id: Optional[str]
     blob_name: Optional[str]
+    # PART 7 — Interrupt context
+    was_interruption: Optional[bool]
+    partial_response: Optional[str]
+    previous_intent: Optional[str]
 
 # --- Nodes ---
 
 async def call_llm_node(state: AgentState):
-    """Generates a response using Gemini, returning both AI text and memory."""
+    """Router-based LLM node that picks the best model and generates the final response."""
     
-    # Fetch memory context from Neo4j
-    memory_context = await memory_pipeline.build_memory_context(
+    # 1. Fetch memory context and signals from Neo4j
+    routing_context = await memory_pipeline.build_routing_context(
         state["user_id"], 
+        state["session_id"],
         state["query"]
     )
     
-    # Enrich the query
-    enriched_query = f"""
-    Memory Context: {memory_context}
+    # 2. Call the Smart Router to get selected_model and enriched_prompt
+    router_resp = await router_service.route_request(state, routing_context)
+    selected_model = router_resp.get("selected_model", "gpt-4o")
+    enriched_prompt = router_resp.get("enriched_system_prompt", "")
+
+    # PART 7 — Inject interrupt context so the LLM can continue naturally
+    if state.get("was_interruption") and state.get("partial_response"):
+        partial = state["partial_response"][:300]
+        enriched_prompt += (
+            "\n\n[INTERRUPT CONTEXT: The user interrupted your previous response. "
+            f"You had said: '{partial}'. "
+            "Continue the conversation naturally — acknowledge the interruption "
+            "only if helpful, then address the new request directly.]"
+        )
+        print(f"[Agent] Interrupt context injected. Partial: '{partial[:80]}...'")
     
-    Current User Query: {state["query"]}
-    """
+    print(f"[Router] Chosen Model: {selected_model} (Score: {router_resp.get('routing_score')})")
     
-    # Gemini now returns a dict { "ai_response": "...", "memory": { ... } }
-    combined_result = await gemini_service.get_response(
-        enriched_query, 
-        state["image_bytes"], 
-        state["language"]
+    # 3. Call the Workhorse model (using the current azure_ai_service but we pass the model name)
+    # Note: Currently azure_ai_service uses a hard-coded endpoint. 
+    # Let's use the enriched system prompt instead of the old one.
+    combined_result = await azure_ai_service.get_response_with_custom_prompt(
+        prompt=state["query"],
+        image_bytes=state["image_bytes"],
+        language_name=state["language"],
+        custom_system_prompt=enriched_prompt,
+        model_override=selected_model
     )
     
-    # Update state with the results
     return {
         "response_text": combined_result.get("ai_response", "AI could not generate a response."),
         "extracted_memory": combined_result.get("memory", {})

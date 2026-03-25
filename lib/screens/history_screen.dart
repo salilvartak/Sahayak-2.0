@@ -33,6 +33,13 @@ class HistoryScreen extends ConsumerWidget {
         centerTitle: true,
         backgroundColor: Colors.transparent,
         elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh_rounded, color: Colors.white70, size: 22),
+            onPressed: () => ref.read(conversationProvider.notifier).initialize(),
+          ),
+          const SizedBox(width: 8),
+        ],
         leading: IconButton(
           icon: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white, size: 20),
           onPressed: () => Navigator.pop(context),
@@ -153,59 +160,17 @@ class _HistoryCard extends ConsumerWidget {
                     ),
                   ),
 
-                // Query and Play Button
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        turn.query,
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: (17 * settings.textSizeMultiplier).toDouble(),
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ),
-                    _AudioButton(
-                      text: turn.query, 
-                      language: language, 
-                      isUser: true
-                    ),
-                  ],
+                // Voice Note players instead of text
+                _VoicePlayerBubble(
+                  text: turn.query,
+                  language: language,
+                  isUser: true,
                 ),
-                
                 const SizedBox(height: 12),
-                
-                // Response with its own play button
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.04),
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        turn.response,
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.7),
-                          fontSize: (15 * settings.textSizeMultiplier).toDouble(),
-                          height: 1.5,
-                          fontWeight: FontWeight.w300,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Align(
-                        alignment: Alignment.bottomRight,
-                        child: _AudioButton(
-                          text: turn.response, 
-                          language: language, 
-                          isUser: false
-                        ),
-                      ),
-                    ],
-                  ),
+                _VoicePlayerBubble(
+                  text: turn.response,
+                  language: language,
+                  isUser: false,
                 ),
               ],
             ),
@@ -226,22 +191,22 @@ class _ImageError extends StatelessWidget {
   }
 }
 
-class _AudioButton extends ConsumerStatefulWidget {
+class _VoicePlayerBubble extends ConsumerStatefulWidget {
   final String text;
-  final dynamic language; // Use appropriate language type
+  final dynamic language;
   final bool isUser;
 
-  const _AudioButton({
+  const _VoicePlayerBubble({
     required this.text,
     required this.language,
     required this.isUser,
   });
 
   @override
-  ConsumerState<_AudioButton> createState() => _AudioButtonState();
+  ConsumerState<_VoicePlayerBubble> createState() => _VoicePlayerBubbleState();
 }
 
-class _AudioButtonState extends ConsumerState<_AudioButton> {
+class _VoicePlayerBubbleState extends ConsumerState<_VoicePlayerBubble> {
   bool _isPlaying = false;
 
   @override
@@ -255,35 +220,144 @@ class _AudioButtonState extends ConsumerState<_AudioButton> {
           setState(() => _isPlaying = false);
         } else {
           setState(() => _isPlaying = true);
-          // Use the speak method we just added
           await notifier.speak(widget.text, widget.language); 
           if (mounted) setState(() => _isPlaying = false);
         }
       },
+      borderRadius: BorderRadius.circular(16),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         decoration: BoxDecoration(
-          color: widget.isUser ? Colors.blue.withOpacity(0.2) : Colors.white.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.white10),
+          color: widget.isUser ? Colors.blueAccent.withOpacity(0.12) : Colors.greenAccent.withOpacity(0.08),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: widget.isUser ? Colors.blueAccent.withOpacity(0.3) : Colors.greenAccent.withOpacity(0.2),
+            width: 1,
+          ),
         ),
         child: Row(
-          mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              _isPlaying ? Icons.stop_rounded : Icons.play_arrow_rounded,
-              color: Colors.white,
-              size: 16,
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: widget.isUser ? Colors.blueAccent.withOpacity(0.2) : Colors.greenAccent.withOpacity(0.2),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                _isPlaying ? Icons.stop_rounded : Icons.play_arrow_rounded,
+                color: widget.isUser ? Colors.blueAccent.shade100 : Colors.greenAccent.shade100,
+                size: 22,
+              ),
             ),
-            const SizedBox(width: 4),
+            const SizedBox(width: 16),
+            Expanded(
+              // The fixed height prevents the bounding box from jumping up and down during the animation
+              child: SizedBox(
+                height: 24,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    _WaveLine(isAnimating: _isPlaying, height: 12),
+                    const SizedBox(width: 3),
+                    _WaveLine(isAnimating: _isPlaying, height: 16),
+                    const SizedBox(width: 3),
+                    _WaveLine(isAnimating: _isPlaying, height: 10),
+                    const SizedBox(width: 3),
+                    _WaveLine(isAnimating: _isPlaying, height: 18),
+                    const SizedBox(width: 3),
+                    _WaveLine(isAnimating: _isPlaying, height: 14),
+                    const SizedBox(width: 3),
+                    _WaveLine(isAnimating: _isPlaying, height: 8),
+                    const SizedBox(width: 3),
+                    _WaveLine(isAnimating: _isPlaying, height: 16),
+                    const SizedBox(width: 3),
+                    _WaveLine(isAnimating: _isPlaying, height: 12),
+                    const SizedBox(width: 3),
+                    _WaveLine(isAnimating: _isPlaying, height: 18),
+                  ],
+                ),
+              ),
+            ),
             Icon(
-              widget.isUser ? Icons.person_rounded : Icons.android_rounded,
-              color: Colors.white70,
-              size: 14,
+              widget.isUser ? Icons.person_outline_rounded : Icons.smart_toy_outlined,
+              color: widget.isUser ? Colors.blueAccent.withOpacity(0.4) : Colors.greenAccent.withOpacity(0.3),
+              size: 24,
             ),
           ],
         ),
       ),
+    );
+  }
+}
+
+class _WaveLine extends StatefulWidget {
+  final bool isAnimating;
+  final double height;
+  
+  const _WaveLine({required this.isAnimating, required this.height});
+
+  @override
+  State<_WaveLine> createState() => _WaveLineState();
+}
+
+class _WaveLineState extends State<_WaveLine> with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _animation;
+
+  @override
+  void initState() {
+    super.initState();
+    // Offset the duration slightly based on the initial height to create an organic, non-uniform wave effect
+    final speed = 300 + (widget.height * 15).toInt();
+    _controller = AnimationController(
+      vsync: this, 
+      duration: Duration(milliseconds: speed)
+    );
+    
+    _animation = Tween<double>(begin: widget.height * 0.3, end: widget.height * 1.5).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeInOutSine)
+    );
+    
+    if (widget.isAnimating) {
+      _controller.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void didUpdateWidget(_WaveLine oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isAnimating != oldWidget.isAnimating) {
+      if (widget.isAnimating) {
+        _controller.repeat(reverse: true);
+      } else {
+        _controller.stop();
+        _controller.animateTo(0.0); // Reset exactly where we started smoothly
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _animation,
+      builder: (context, child) {
+        return Container(
+          width: 3,
+          height: widget.isAnimating ? _animation.value : widget.height * 0.7,
+          margin: const EdgeInsets.symmetric(horizontal: 1.5),
+          decoration: BoxDecoration(
+            color: widget.isAnimating ? Colors.white : Colors.white24,
+            borderRadius: BorderRadius.circular(2),
+          ),
+        );
+      },
     );
   }
 }

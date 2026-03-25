@@ -117,20 +117,58 @@ class GraphClient:
             prev_id=data.get("prev_interaction_id")
         )).consume()
 
-        # 4. Entities (handled separately in a loop since Cypher FOREACH doesn't support complex Maps well without UNWIND)
-        if data.get("entities"):
+        # 4. Entities (Python-side sanitization ensures we don't pass mixed types to Cypher)
+        entities = data.get("entities", [])
+        sanitized_entities = []
+        for ent in entities:
+            if isinstance(ent, dict):
+                sanitized_entities.append(ent)
+            elif isinstance(ent, str):
+                sanitized_entities.append({"name": ent, "type": "General"})
+
+        if sanitized_entities:
             entity_cypher = """
             UNWIND $entities as ent
             MATCH (i:Interaction {id: $interaction_id})
             MERGE (e:Entity {name: ent.name})
-            SET e.type = ent.type
+            SET e.type = coalesce(ent.type, "General")
             MERGE (i)-[:MENTIONS]->(e)
             """
             await (await tx.run(
                 entity_cypher,
                 interaction_id=data["interaction_id"],
-                entities=data["entities"]
+                entities=sanitized_entities
             )).consume()
+
+    async def get_routing_signals(self, session_id: str):
+        """Calculates session depth and continuity score for the current session."""
+        if not self._driver: return {"depth": 0, "continuity": 0.0}
+        async with self._driver.session() as session:
+            # 1. Depth: Number of interactions in this session
+            depth_res = await session.run(
+                "MATCH (:Session {id: $session_id})-[:HAS_INTERACTION]->(i:Interaction) RETURN count(i) as c",
+                session_id=session_id
+            )
+            depth_rec = await depth_res.single()
+            depth = depth_rec["c"] if depth_rec else 0
+            
+            # 2. Continuity: Length of the longest FOLLOWS chain in this session
+            chain_res = await session.run(
+                "MATCH (s:Session {id: $session_id})-[:HAS_INTERACTION]->(i:Interaction) "
+                "OPTIONAL MATCH p = (i)-[:FOLLOWS*]->(:Interaction) "
+                "RETURN length(p) as chain ORDER BY chain DESC LIMIT 1",
+                session_id=session_id
+            )
+            chain_rec = await chain_res.single()
+            chain_len = chain_rec["chain"] if chain_rec and chain_rec["chain"] is not None else 0
+            
+            # Simple score: normalized continuity (chain / depth) 
+            continuity = (chain_len / depth) if depth > 0 else 0.0
+            
+            return {
+                "depth": depth,
+                "continuity": min(continuity, 1.0)
+            }
 
     async def get_related_context(self, user_id: str, query: str, limit: int = 5):
         if not self._driver: return {"topics": [], "entities": []}

@@ -10,11 +10,15 @@ router = APIRouter()
 @router.post("/ask", response_model=AskResponse)
 async def ask(
     background_tasks: BackgroundTasks,
-    device_id: str = Form(...),          # Map device_id from flutter to user_id
-    session_id: str = Form("default"),   # Session ID
+    device_id: str = Form(...),
+    session_id: str = Form("default"),
     query: str = Form(...),
     language: str = Form(...),
-    image: UploadFile = File(None)
+    image: UploadFile = File(None),
+    # PART 7 — Interrupt context
+    was_interruption: bool = Form(False),
+    partial_response: str = Form(""),
+    previous_intent: str = Form(""),
 ):
     interaction_id = str(uuid.uuid4())
     image_bytes = None
@@ -51,7 +55,10 @@ async def ask(
             "image_bytes": image_bytes,
             "blob_name": blob_name,
             "metadata": {"user_id": device_id},
-            "prev_interaction_id": prev_interaction_id
+            "prev_interaction_id": prev_interaction_id,
+            "was_interruption": was_interruption,
+            "partial_response": partial_response,
+            "previous_intent": previous_intent,
         }
         print(f"[ask] query='{query}' | language='{language}' | image={'yes' if image_bytes else 'no'} ({len(image_bytes) if image_bytes else 0} bytes)", flush=True)
 

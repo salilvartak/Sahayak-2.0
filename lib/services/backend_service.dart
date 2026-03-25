@@ -1,81 +1,128 @@
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import '../models/language.dart';
 
-class BackendService {
-  String get _baseUrl => (dotenv.env['BACKEND_URL'] ?? 'http://localhost:8000').trim();
+/// Response object that carries both the text and the interaction ID
+/// (needed for context-aware follow-ups and interruption handling).
+class BackendResponse {
+  final String response;
+  final String interactionId;
+  const BackendResponse({required this.response, required this.interactionId});
+}
 
-  /// Sends a voice query + optional camera image to the backend.
-  /// Returns the AI text response.
-  Future<String> getResponse({
+/// PART 7: Context-aware backend payload
+/// PART 8: Network resilience — retry with exponential backoff + graceful fallback
+class BackendService {
+  String get _baseUrl =>
+      (dotenv.env['BACKEND_URL'] ?? 'http://localhost:8000').trim();
+
+  static const int _maxRetries = 3;
+  static const String _fallbackMessage =
+      "I'm having trouble connecting. Please try again.";
+
+  /// Send a voice query to the backend with interrupt context and retry logic.
+  Future<BackendResponse> getResponse({
     required String deviceId,
     required String query,
     required File? imageFile,
     required Language language,
+    String sessionId = 'default',
+    bool wasInterruption = false,
+    String partialResponse = '',
+    String previousIntent = '',
   }) async {
-    final uri = Uri.parse('$_baseUrl/ask');
-    final request = http.MultipartRequest('POST', uri);
-
-    request.fields['device_id'] = deviceId;
-    request.fields['query'] = query;
-    // language.name = lowercase enum name (e.g. 'hindi', 'marathi', 'english')
-    // backend capitalizes it to match system_prompt keys
-    request.fields['language'] = language.name;
-
-    debugPrint('📤 [Backend] Sending request to $uri');
-    debugPrint('📤 [Backend] device_id : $deviceId');
-    debugPrint('📤 [Backend] language  : ${language.name}');
-    debugPrint('📤 [Backend] query     : "$query"');
-    debugPrint('📤 [Backend] has image : ${imageFile != null}');
-
-    if (imageFile != null) {
-      request.files.add(await http.MultipartFile.fromPath(
-        'image',
-        imageFile.path,
-      ));
-    }
-
-    try {
-      final streamedResponse = await request.send().timeout(const Duration(seconds: 60));
-      final response = await http.Response.fromStream(streamedResponse);
-
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        final responseText = (data['response'] as String).trim();
-        debugPrint('📥 [Backend] Response: "$responseText"');
-        return responseText;
-      } else {
-        debugPrint('❌ [Backend] Error ${response.statusCode}: ${response.body}');
-        throw Exception('Backend error (${response.statusCode})');
+    for (int attempt = 0; attempt < _maxRetries; attempt++) {
+      if (attempt > 0) {
+        // Exponential backoff: 2s, 4s
+        final delayMs = 2000 * (1 << (attempt - 1));
+        debugPrint('[Backend] Retry $attempt/${_maxRetries - 1} after ${delayMs}ms');
+        await Future.delayed(Duration(milliseconds: delayMs));
       }
-    } catch (e) {
-      debugPrint('BackendService error: $e');
-      rethrow;
+
+      try {
+        final uri = Uri.parse('$_baseUrl/ask');
+        final request = http.MultipartRequest('POST', uri);
+
+        request.fields['device_id'] = deviceId;
+        request.fields['session_id'] = sessionId;
+        request.fields['query'] = query;
+        request.fields['language'] = language.name;
+        request.fields['was_interruption'] = wasInterruption.toString();
+        request.fields['partial_response'] = partialResponse;
+        request.fields['previous_intent'] = previousIntent;
+
+        debugPrint('[Backend] Attempt ${attempt + 1}/$_maxRetries '
+            'query="${query.substring(0, query.length.clamp(0, 60))}" '
+            'interruption=$wasInterruption');
+
+        if (imageFile != null) {
+          request.files.add(await http.MultipartFile.fromPath(
+            'image',
+            imageFile.path,
+          ));
+        }
+
+        final streamedResponse =
+            await request.send().timeout(const Duration(seconds: 60));
+        final response = await http.Response.fromStream(streamedResponse);
+
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body) as Map<String, dynamic>;
+          final text = ((data['response'] as String?) ?? '').trim();
+          final iid = (data['interaction_id'] as String?) ?? '';
+          debugPrint('[Backend] OK — ${text.length} chars, id=$iid');
+          return BackendResponse(response: text, interactionId: iid);
+        } else if (response.statusCode == 429 ||
+            response.statusCode >= 500) {
+          // Transient error — retry
+          debugPrint('[Backend] Transient error ${response.statusCode}');
+          continue;
+        } else {
+          // Non-retryable client error
+          throw Exception(
+              'Backend error (${response.statusCode}): ${response.body}');
+        }
+      } on TimeoutException catch (e) {
+        debugPrint('[Backend] Timeout on attempt ${attempt + 1}: $e');
+        // Retry on timeout
+      } on SocketException catch (e) {
+        debugPrint('[Backend] Network error on attempt ${attempt + 1}: $e');
+        // Retry on network errors
+      } catch (e) {
+        debugPrint('[Backend] Unexpected error on attempt ${attempt + 1}: $e');
+        // Don't retry unexpected errors
+        rethrow;
+      }
     }
+
+    debugPrint('[Backend] All $maxRetries retries exhausted — using fallback');
+    return const BackendResponse(
+        response: _fallbackMessage, interactionId: '');
   }
 
-  /// Fetches history from the backend.
+  static const int maxRetries = _maxRetries;
+
+  /// Fetch conversation history for a device.
   Future<List<dynamic>> getHistory(String deviceId) async {
     final uri = Uri.parse('$_baseUrl/history?device_id=$deviceId');
     try {
-      final response = await http.get(uri).timeout(const Duration(seconds: 30));
+      final response =
+          await http.get(uri).timeout(const Duration(seconds: 30));
       if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        return data['items'] as List<dynamic>;
-      } else {
-        debugPrint('Backend error ${response.statusCode}: ${response.body}');
-        return [];
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        return (data['items'] as List<dynamic>?) ?? [];
       }
+      debugPrint('[Backend] History error ${response.statusCode}');
     } catch (e) {
-      debugPrint('BackendService history error: $e');
-      return [];
+      debugPrint('[Backend] History fetch error: $e');
     }
+    return [];
   }
 
-  /// Saves user profile/settings to the backend.
   Future<void> saveProfile({
     required String deviceId,
     required double textSizeMultiplier,
@@ -97,20 +144,20 @@ class BackendService {
         }),
       ).timeout(const Duration(seconds: 10));
     } catch (e) {
-      debugPrint('BackendService profile save error: $e');
+      debugPrint('[Backend] Profile save error: $e');
     }
   }
 
-  /// Fetches user profile/settings from the backend.
   Future<Map<String, dynamic>?> getProfile(String deviceId) async {
     final uri = Uri.parse('$_baseUrl/profile/$deviceId');
     try {
-      final response = await http.get(uri).timeout(const Duration(seconds: 10));
+      final response =
+          await http.get(uri).timeout(const Duration(seconds: 10));
       if (response.statusCode == 200) {
         return jsonDecode(response.body) as Map<String, dynamic>;
       }
     } catch (e) {
-      debugPrint('BackendService profile fetch error: $e');
+      debugPrint('[Backend] Profile fetch error: $e');
     }
     return null;
   }

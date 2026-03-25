@@ -149,6 +149,57 @@ class AzureAIService:
         _log(f"[AzureAI] TOTAL FAILURE. Last error: {last_error}")
         return self._fallback_error(language_name, last_error)
 
+    async def get_response_with_custom_prompt(
+        self,
+        prompt: str,
+        image_bytes: bytes | None,
+        language_name: str,
+        custom_system_prompt: str,
+        model_override: str = "gpt-4o"
+    ) -> dict:
+        """Call Workhorse model with the Router's enriched system prompt."""
+        lang_cap = language_name.capitalize() if language_name else "English"
+        
+        # Azure requires the word "json" to appear in the messages array if response_format is json_object
+        custom_system_prompt += "\n\nYou MUST return your output strictly in JSON format."
+        
+        # Build user content
+        if image_bytes:
+            mime_type = "image/jpeg"
+            b64_image = base64.b64encode(image_bytes).decode("utf-8")
+            user_content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}}
+            ]
+        else:
+            user_content = prompt
+
+        messages = [
+            {"role": "system", "content": custom_system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+        
+        # In a real Azure setup, model_override would change the 'deployment_name' in the URL.
+        # For this implementation, we will use your primary endpoint.
+        payload = {
+            "messages": messages,
+            "temperature": 0.5,
+            "max_tokens": 4096,
+            "response_format": {"type": "json_object"}
+        }
+        
+        headers = { "api-key": self.api_key, "Content-Type": "application/json" }
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(self.endpoint, headers=headers, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                return self._parse_response(content, lang_cap)
+            else:
+                _log(f"Workhorse call failed: {resp.status_code} {resp.text}")
+                return self._fallback_error(language_name, "Workhorse failure")
+
     def _parse_response(self, content: str, language_name: str) -> dict:
         """Parse JSON string from the LLM into the expected dict format."""
         try:
@@ -173,6 +224,29 @@ class AzureAIService:
                 "ai_response": content.strip(),
                 "memory": {"entities": [], "intent": "conversational", "topic": "general"}
             }
+
+    async def raw_call(self, system_message: str, user_message: str) -> str:
+        """Call LLM with custom system message (used by Router)."""
+        system_message += "\n\nYou MUST return your output strictly in JSON format."
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message}
+        ]
+        payload = {
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 2048,
+            "response_format": {"type": "json_object"}
+        }
+        headers = { "api-key": self.api_key, "Content-Type": "application/json" }
+        
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(self.endpoint, headers=headers, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            else:
+                raise Exception(f"Raw call failed: {resp.status_code} {resp.text}")
 
     def _fallback_error(self, lang: str, error_msg: str) -> dict:
         return {

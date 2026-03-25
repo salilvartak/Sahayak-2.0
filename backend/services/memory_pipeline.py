@@ -33,34 +33,41 @@ class MemoryPipeline:
         except Exception as e:
             print(f"Neo4j update failed, but continuing background task... {e}")
 
-    async def build_memory_context(self, user_id: str, query: str):
-        """
-        Fetch relevant nodes from Neo4j and return structured context for LLM.
-        """
+    async def build_routing_context(self, user_id: str, session_id: str, query: str):
+        """Fetch all signals from Neo4j for the Smart Router."""
         try:
+            # 1. Fetch graph context (topics, entities)
             context_data = await graph_client.get_related_context(user_id, query)
             
-            # Format topics for prompt
-            topics = context_data.get("topics", [])
-            topics_str = ", ".join([str(t) for t in topics]) if topics else "None yet"
+            # 2. Fetch session metrics (depth, continuity)
+            metrics = await graph_client.get_routing_signals(session_id)
             
-            # Format entities safely
-            entities = context_data.get("entities", [])
-            formatted_entities = []
-            for e in entities:
-                if isinstance(e, dict):
-                    name = e.get("name", "Unknown")
-                    etype = e.get("type", "Thing")
-                    formatted_entities.append(f"{name} ({etype})")
-                else:
-                    formatted_entities.append(str(e))
-            
-            entities_str = ", ".join(formatted_entities) if formatted_entities else "None"
-            
-            context_summary = f"User is interested in: {topics_str}. Recently mentioned things: {entities_str}."
-            return context_summary
+            # 3. Construct the router-ready memory object
+            # Note: inferred_domain and expertise_hint would ideally come from 
+            # user profiles/past intents, defaulting to null/unknown for now.
+            return {
+                "dominant_topics": context_data.get("topics", []),
+                "session_depth": metrics["depth"],
+                "continuity_score": metrics["continuity"],
+                "recent_intents": [], # Placeholder for intent history
+                "user_interests": context_data.get("topics", []),
+                "inferred_domain": None,
+                "expertise_hint": "unknown",
+                "last_model_used": None,
+                "entities_mentioned": [str(e.get("name")) for e in context_data.get("entities", []) if isinstance(e, dict)]
+            }
         except Exception as e:
-            print(f"Could not build memory context: {e}")
-            return "No previous memory context found for this user."
+            print(f"Error building routing context: {e}")
+            return {
+                "dominant_topics": [],
+                "session_depth": 0,
+                "continuity_score": 0.0,
+                "recent_intents": [],
+                "user_interests": [],
+                "inferred_domain": None,
+                "expertise_hint": "unknown",
+                "last_model_used": None,
+                "entities_mentioned": []
+            }
 
 memory_pipeline = MemoryPipeline()

@@ -17,16 +17,16 @@ async def get_history(
         raise HTTPException(status_code=400, detail="User ID or Device ID required")
         
     try:
-        # Optimization: Fetch with partition key for high performance
-        query = "SELECT * FROM c WHERE c.user_id = @user_id ORDER BY c.timestamp DESC"
+        # Use user_id for the query because it's the partition key in Azure
+        query = "SELECT * FROM c WHERE (c.user_id = @id OR c.device_id = @id) ORDER BY c.timestamp DESC"
         
-        # Note: We must convert to list explicitly to trigger the fetch
-        # and provide the partition_key to avoid cross-partition query overhead/errors
         interactions = list(cosmos_client.container.query_items(
             query=query,
-            parameters=[{"name": "@user_id", "value": final_user_id}],
-            partition_key=final_user_id
+            parameters=[{"name": "@id", "value": final_user_id}],
+            enable_cross_partition_query=True 
         ))[:limit]
+        
+        print(f"DEBUG: Found {len(interactions)} items in Cosmos for ID {final_user_id}")
         
         history_items = []
         for item in interactions:
@@ -34,11 +34,11 @@ async def get_history(
             if item.get("blob_name"):
                 image_url = await blob_service.get_image_sas_url(item["blob_name"])
             
-            # Robust field extraction to prevent Pydantic errors if fields are null or missing
+            # Map robustly to catch both OLD and NEW data formats
             history_items.append(HistoryItem(
-                interaction_id=item.get("id", str(uuid.uuid4())),
-                query=item.get("user_message", ""),
-                response=item.get("ai_response", "No response"),
+                interaction_id=item.get("id", ""),
+                query=item.get("user_message") or item.get("query", ""),
+                response=item.get("ai_response") or item.get("response", "No response"),
                 language=item.get("language", "en"),
                 timestamp=item.get("timestamp", ""),
                 image_url=image_url

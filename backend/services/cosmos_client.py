@@ -16,112 +16,68 @@ class CosmosClientService:
             return
 
         try:
-            # We use the blocking client. For high-volume async, one might use a wrapper,
-            # but for this scale, direct call in thread-safe manner is okay or just 
-            # calling it as-is (FastAPI handles it).
             self.client = CosmosClient(settings.AZURE_COSMOS_ENDPOINT, settings.AZURE_COSMOS_KEY)
-            
-            # Create DB if it doesn't exist
             self.database = self.client.create_database_if_not_exists(id=settings.AZURE_COSMOS_DATABASE)
             
-            # Create container if it doesn't exist with partition key /user_id
+            # Reverting to your existing container's partition key
             self.container = self.database.create_container_if_not_exists(
                 id=settings.AZURE_COSMOS_CONTAINER,
                 partition_key=PartitionKey(path="/user_id"),
-                default_ttl=-1, # Enable TTL
+                default_ttl=-1, 
                 offer_throughput=400 
             )
             print("Cosmos DB (Primary Storage) initialized successfully with /user_id partition key.")
         except exceptions.CosmosHttpResponseError as ex:
             print(f"Failed to initialize Cosmos DB: {ex.message}")
-        except Exception as e:
-            print(f"An error occurred during Cosmos DB initialization: {type(e).__name__}: {e}")
 
     async def save_interaction(self, data: dict):
-        """
-        Store raw conversation data in Cosmos DB.
-        Expects keys: user_id, session_id, interaction_id, user_message, ai_response, language, metadata
-        """
+        """Store raw conversation data in Cosmos DB."""
         if self.container is None:
             await self.init()
-            if self.container is None:
-                raise Exception("Cosmos DB not initialized")
 
-        # Prepare document
+        user_id = data.get("user_id") or data.get("device_id")
+        
         doc = {
             "id": data.get("interaction_id", str(uuid.uuid4())),
-            "user_id": data["user_id"],
-            "session_id": data["session_id"],
-            "interaction_id": data.get("interaction_id", str(uuid.uuid4())),
+            "type": "interaction",
+            "user_id": user_id, 
+            "device_id": user_id, # Save both for compatibility
+            "session_id": data.get("session_id"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "user_message": data["user_message"],
-            "ai_response": data["ai_response"],
-            "language": data["language"],
+            # Save in both formats so old and new routers can find it
+            "user_message": data.get("user_message") or data.get("query"),
+            "query": data.get("user_message") or data.get("query"),
+            "ai_response": data.get("ai_response") or data.get("response"),
+            "response": data.get("ai_response") or data.get("response"),
+            "language": data.get("language"),
             "blob_name": data.get("blob_name"),
-            "metadata": data.get("metadata", {}),
             "ttl": 7776000 # 90 days
         }
 
         try:
             self.container.upsert_item(doc)
-            print(f"Interaction {doc['id']} saved to Cosmos DB for User {doc['user_id']}.")
+            print(f"Interaction {doc['id']} saved to Cosmos DB for Device {device_id}.")
             return doc
         except exceptions.CosmosHttpResponseError as ex:
             print(f"Failed to save interaction to Cosmos: {ex.message}")
             raise
 
-    async def get_user_sessions(self, user_id: str):
-        """Retrieve list of unique session_ids for a user."""
+    async def get_history_for_device(self, device_id: str, limit: int = 50):
+        """Retrieve interaction history for a device."""
         if self.container is None:
             await self.init()
 
         try:
-            query = "SELECT DISTINCT c.session_id FROM c WHERE c.user_id = @user_id"
+            query = "SELECT * FROM c WHERE c.device_id = @id AND c.type = 'interaction' ORDER BY c.timestamp DESC"
             items = list(self.container.query_items(
                 query=query,
-                parameters=[{"name": "@user_id", "value": user_id}],
-                enable_cross_partition_query=False
-            ))
-            return [item["session_id"] for item in items]
-        except exceptions.CosmosHttpResponseError as ex:
-            print(f"Failed to query sessions: {ex.message}")
-            return []
-
-    async def get_session_history(self, session_id: str):
-        """Retrieve full interaction history for a session."""
-        if self.container is None:
-            await self.init()
-
-        try:
-            # Note: Cross-partition query if user_id is unknown, 
-            # ideally we should pass user_id too for efficiency.
-            query = "SELECT * FROM c WHERE c.session_id = @session_id ORDER BY c.timestamp ASC"
-            items = list(self.container.query_items(
-                query=query,
-                parameters=[{"name": "@session_id", "value": session_id}],
-                enable_cross_partition_query=True 
-            ))
+                parameters=[{"name": "@id", "value": device_id}],
+                partition_key=device_id
+            ))[:limit]
             return items
         except exceptions.CosmosHttpResponseError as ex:
-            print(f"Failed to query session history: {ex.message}")
+            print(f"Failed to query history: {ex.message}")
             return []
 
-    async def get_last_interaction_id(self, session_id: str):
-        """Retrieve the most recent interaction ID for a session."""
-        if self.container is None:
-            await self.init()
-
-        try:
-            # Query the latest interaction for this session
-            query = "SELECT TOP 1 c.id FROM c WHERE c.session_id = @session_id ORDER BY c.timestamp DESC"
-            items = list(self.container.query_items(
-                query=query,
-                parameters=[{"name": "@session_id", "value": session_id}],
-                enable_cross_partition_query=True
-            ))
-            return items[0]["id"] if items else None
-        except exceptions.CosmosHttpResponseError as ex:
-            print(f"Failed to query last interaction ID: {ex.message}")
-            return None
 
 cosmos_client = CosmosClientService()
