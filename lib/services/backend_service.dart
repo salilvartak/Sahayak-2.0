@@ -1,9 +1,9 @@
 import 'dart:io';
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
-import 'dart:convert';
 import '../models/language.dart';
 
 /// Response object that carries both the text and the interaction ID
@@ -105,6 +105,58 @@ class BackendService {
   }
 
   static const int maxRetries = _maxRetries;
+
+  /// Stream a voice query response as SSE tokens from /ask/stream.
+  /// Yields plain-text chunks as they arrive; caller splits at sentence
+  /// boundaries and feeds each sentence to TTSService.speakStreaming().
+  Stream<String> streamResponse({
+    required String deviceId,
+    required String query,
+    required File? imageFile,
+    required Language language,
+    String sessionId = 'default',
+    bool wasInterruption = false,
+    String partialResponse = '',
+    String previousIntent = '',
+  }) async* {
+    final uri = Uri.parse('$_baseUrl/ask/stream');
+    final request = http.MultipartRequest('POST', uri);
+
+    request.fields['device_id'] = deviceId;
+    request.fields['session_id'] = sessionId;
+    request.fields['query'] = query;
+    request.fields['language'] = language.name;
+    request.fields['was_interruption'] = wasInterruption.toString();
+    request.fields['partial_response'] = partialResponse;
+    request.fields['previous_intent'] = previousIntent;
+
+    if (imageFile != null) {
+      request.files.add(
+        await http.MultipartFile.fromPath('image', imageFile.path),
+      );
+    }
+
+    debugPrint('[Backend/stream] Starting SSE stream for query="${query.substring(0, query.length.clamp(0, 60))}"');
+
+    final streamedResponse =
+        await request.send().timeout(const Duration(seconds: 15));
+
+    if (streamedResponse.statusCode != 200) {
+      throw Exception(
+          'Stream error ${streamedResponse.statusCode}');
+    }
+
+    final lines = streamedResponse.stream
+        .transform(utf8.decoder)
+        .transform(const LineSplitter());
+
+    await for (final line in lines) {
+      if (!line.startsWith('data: ')) continue;
+      final data = line.substring(6);
+      if (data == '[DONE]') break;
+      if (data.isNotEmpty) yield data;
+    }
+  }
 
   /// Fetch conversation history for a device.
   Future<List<dynamic>> getHistory(String deviceId) async {

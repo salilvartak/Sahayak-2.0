@@ -28,6 +28,11 @@ class AzureAIService:
         self.endpoint = settings.AZURE_AI_MODEL_ROUTER_ENDPOINT
         self.api_key = settings.AZURE_AI_MODEL_ROUTER_KEY
 
+        # Persistent client — reuses TCP + TLS connections across requests (~150ms saved per call)
+        self._http = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+
         if not self.endpoint or not self.api_key:
             _log("WARNING: Azure AI Model Router endpoint or key not configured.")
         else:
@@ -84,9 +89,10 @@ class AzureAIService:
         ]
 
         payload = {
+            "model": "gpt-4o",
             "messages": messages,
             "temperature": 0.3,
-            "max_tokens": 4096,
+            "max_tokens": 1024,
             "response_format": {"type": "json_object"}
         }
 
@@ -99,11 +105,11 @@ class AzureAIService:
         last_error = "Unknown"
         for attempt in range(3):
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.post(
+                resp = await self._http.post(
                         self.endpoint,
                         headers=headers,
-                        json=payload
+                        json=payload,
+                        timeout=30.0,
                     )
 
                 if resp.status_code == 200:
@@ -147,7 +153,7 @@ class AzureAIService:
                 break
 
         _log(f"[AzureAI] TOTAL FAILURE. Last error: {last_error}")
-        return self._fallback_error(language_name, last_error)
+        return await self._fallback_to_gemini(prompt, image_bytes, language_name, sys_prompt)
 
     async def get_response_with_custom_prompt(
         self,
@@ -159,11 +165,13 @@ class AzureAIService:
     ) -> dict:
         """Call Workhorse model with the Router's enriched system prompt."""
         lang_cap = language_name.capitalize() if language_name else "English"
-        
-        # Azure requires the word "json" to appear in the messages array if response_format is json_object
-        custom_system_prompt += "\n\nYou MUST return your output strictly in JSON format."
-        
-        # Build user content
+
+        custom_system_prompt += (
+            "\n\nYou MUST return your output strictly in JSON format."
+            "\nCRITICAL: The 'memory' fields (entities, intent, topic) MUST be in English only,"
+            " regardless of the user's language. Never use any non-English script in memory fields."
+        )
+
         if image_bytes:
             mime_type = "image/jpeg"
             b64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -178,27 +186,117 @@ class AzureAIService:
             {"role": "system", "content": custom_system_prompt},
             {"role": "user", "content": user_content}
         ]
-        
-        # In a real Azure setup, model_override would change the 'deployment_name' in the URL.
-        # For this implementation, we will use your primary endpoint.
+
         payload = {
+            "model": model_override,
             "messages": messages,
             "temperature": 0.5,
-            "max_tokens": 4096,
+            "max_tokens": 2048 if image_bytes else 1024,
             "response_format": {"type": "json_object"}
         }
-        
-        headers = { "api-key": self.api_key, "Content-Type": "application/json" }
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(self.endpoint, headers=headers, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                return self._parse_response(content, lang_cap)
-            else:
-                _log(f"Workhorse call failed: {resp.status_code} {resp.text}")
-                return self._fallback_error(language_name, "Workhorse failure")
+        headers = {"api-key": self.api_key, "Content-Type": "application/json"}
+
+        last_error = "Unknown"
+        for attempt in range(3):
+            try:
+                resp = await self._http.post(self.endpoint, headers=headers, json=payload, timeout=60.0)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    return self._parse_response(content, lang_cap)
+
+                last_error = f"HTTP {resp.status_code}"
+                _log(f"[Workhorse] Attempt {attempt + 1} failed: {resp.status_code}")
+                if resp.status_code in (429, 500, 503) and attempt < 2:
+                    await asyncio.sleep((attempt + 1) * 2)
+                    continue
+                break
+
+            except httpx.TimeoutException:
+                last_error = "timeout"
+                _log(f"[Workhorse] Timeout on attempt {attempt + 1}")
+                if attempt < 2:
+                    await asyncio.sleep((attempt + 1) * 2)
+            except Exception as e:
+                last_error = str(e)
+                _log(f"[Workhorse] Error on attempt {attempt + 1}: {e}")
+                break
+
+        _log(f"[Workhorse] All attempts failed: {last_error}")
+        return await self._fallback_to_gemini(prompt, image_bytes, language_name, custom_system_prompt)
+
+    async def stream_text(
+        self,
+        prompt: str,
+        image_bytes: bytes | None,
+        language_name: str,
+        system_prompt_text: str,
+        model: str = "gpt-4o",
+    ):
+        """
+        Async generator that streams plain-text tokens from the LLM.
+        Yields str chunks as they arrive — caller feeds them to TTS at sentence
+        boundaries for low-latency speech output (~1-2 s to first word).
+        """
+        lang_cap = language_name.capitalize() if language_name else "English"
+        lang_enforcement = (
+            f"\n\n[IMPORTANT: Respond ONLY in {lang_cap}. "
+            "Write plain sentences — no JSON, no bullet points, no numbered lists.]"
+        )
+        prompt_with_lang = prompt + lang_enforcement
+
+        if image_bytes:
+            mime_type = "image/jpeg"
+            if image_bytes[:4] == b'\x89PNG':
+                mime_type = "image/png"
+            b64_image = base64.b64encode(image_bytes).decode("utf-8")
+            user_content = [
+                {"type": "text", "text": prompt_with_lang},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}}
+            ]
+        else:
+            user_content = prompt_with_lang
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt_text},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1024,
+            "stream": True,
+        }
+        headers = {"api-key": self.api_key, "Content-Type": "application/json"}
+
+        _log(f"[StreamText] model={model} lang={lang_cap} image={'yes' if image_bytes else 'no'}")
+        try:
+            async with self._http.stream(
+                "POST", self.endpoint, headers=headers, json=payload, timeout=30.0
+            ) as resp:
+                if resp.status_code != 200:
+                    _log(f"[StreamText] HTTP error {resp.status_code}")
+                    return
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue  # usage/metadata chunk — no content
+                        content = choices[0].get("delta", {}).get("content", "")
+                        if content:
+                            # Replace newlines so they don't break SSE framing
+                            yield content.replace("\n", " ")
+                    except json.JSONDecodeError:
+                        pass
+        except Exception as e:
+            _log(f"[StreamText] Error: {e}")
 
     def _parse_response(self, content: str, language_name: str) -> dict:
         """Parse JSON string from the LLM into the expected dict format."""
@@ -233,6 +331,7 @@ class AzureAIService:
             {"role": "user", "content": user_message}
         ]
         payload = {
+            "model": "gpt-4o",
             "messages": messages,
             "temperature": 0.1,
             "max_tokens": 2048,
@@ -240,19 +339,65 @@ class AzureAIService:
         }
         headers = { "api-key": self.api_key, "Content-Type": "application/json" }
         
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(self.endpoint, headers=headers, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
-            else:
-                raise Exception(f"Raw call failed: {resp.status_code} {resp.text}")
+        last_error = "Unknown"
+        for attempt in range(3):
+            try:
+                resp = await self._http.post(self.endpoint, headers=headers, json=payload, timeout=45.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data["choices"][0]["message"]["content"]
+                last_error = f"HTTP {resp.status_code}"
+                _log(f"[RawCall] Attempt {attempt + 1} failed: {resp.status_code}")
+                if resp.status_code in (429, 500, 503) and attempt < 2:
+                    await asyncio.sleep((attempt + 1) * 2)
+                    continue
+                break
+            except httpx.TimeoutException:
+                last_error = "timeout"
+                _log(f"[RawCall] Timeout on attempt {attempt + 1}")
+                if attempt < 2:
+                    await asyncio.sleep((attempt + 1) * 2)
+            except Exception as e:
+                last_error = str(e)
+                _log(f"[RawCall] Error on attempt {attempt + 1}: {e}")
+                break
+        raise Exception(f"Raw call failed after 3 attempts: {last_error}")
 
     def _fallback_error(self, lang: str, error_msg: str) -> dict:
         return {
             "ai_response": system_prompt.get_unclear_message(lang),
             "memory": {"entities": [], "intent": f"error: {error_msg}", "topic": "system"}
         }
+
+    async def _fallback_to_gemini(self, prompt: str, image_bytes, language_name: str, sys_prompt: str) -> dict:
+        _log("[Gemini Fallback] Azure attempts failed. Trying Native Gemini...")
+        if not getattr(settings, "GEMINI_API_KEY", None):
+            return self._fallback_error(language_name, "Azure failed and no Gemini API key configured.")
+
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=settings.GEMINI_API_KEY)
+            model_name = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash-lite")
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={"response_mime_type": "application/json"}
+            )
+            
+            gemini_sys = sys_prompt + "\n\nYou MUST return your output strictly in JSON format."
+            
+            contents = [gemini_sys, prompt]
+            if image_bytes:
+                import PIL.Image
+                import io
+                img = PIL.Image.open(io.BytesIO(image_bytes))
+                contents.append(img)
+            
+            resp = await model.generate_content_async(contents)
+            lang_cap = language_name.capitalize() if language_name else "English"
+            return self._parse_response(resp.text, lang_cap)
+        except Exception as e:
+            _log(f"[Gemini Fallback] Failed: {e}")
+            return self._fallback_error(language_name, f"Azure and Gemini both failed. Last err: {e}")
 
 # Global instance — used by agent.py
 azure_ai_service = AzureAIService()

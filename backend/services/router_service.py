@@ -1,5 +1,4 @@
 import json
-import base64
 from services.azure_ai_service import azure_ai_service
 from prompts import system_prompt
 
@@ -113,7 +112,12 @@ This is a new session. Introduce concepts clearly.
 ## OUTPUT FORMAT
 You MUST return your response as a JSON object with:
 1. "ai_response": Spoken text in {language}.
-2. "memory": { "entities": [], "intent": "", "topic": "" }
+2. "memory": {
+     "entities": List of up to 5 key entities in ENGLISH only (e.g. [{"name": "Paracetamol", "type": "Medicine"}]),
+     "intent": The user's main goal in ENGLISH only (1-3 words, e.g. "identify medicine"),
+     "topic": The core subject in ENGLISH only (1-2 words, e.g. "health")
+   }
+CRITICAL: The "memory" fields MUST always be in English script only, regardless of the user's language. Never use Hindi, Marathi, Telugu, Tamil, or any non-English script in memory fields.
 ```
 
 ---
@@ -126,16 +130,15 @@ Return a single JSON object with: selected_model, routing_score, routing_path, o
         """Calls the 'Router model' to decide the workhorse model."""
         
         # 1. Prepare inputs
-        image_b64 = None
-        if state.get("image_bytes"):
-            image_b64 = base64.b64encode(state["image_bytes"]).decode("utf-8")
-
+        # NOTE: Never send actual image bytes to the router — base64 alone is
+        # ~80-120k tokens and will blow the 128k context limit.
+        # The router only needs to know whether an image is present.
         router_input = {
             "user_id": state["user_id"],
             "session_id": state["session_id"],
             "query": state["query"],
             "language": state["language"],
-            "image_bytes": image_b64,
+            "image_bytes": "present" if state.get("image_bytes") else None,
             "prev_interaction_id": state.get("prev_interaction_id"),
             "azure_speech_metadata": {
                 "confidence": state.get("metadata", {}).get("confidence", 0.9),

@@ -15,13 +15,13 @@ class ImageUtils {
     
     if (image == null) return File(path);
 
-    // Resize to reasonable size for mobile AI
-    if (image.width > 1200) {
-      image = img.copyResize(image, width: 1200);
+    // Resize to 800px max — sufficient for GPT-4o to read text/labels/documents
+    if (image.width > 800) {
+      image = img.copyResize(image, width: 800);
     }
 
-    // Compress to JPEG with 70% quality
-    final compressedBytes = img.encodeJpg(image, quality: 70);
+    // Compress to JPEG with 60% quality — imperceptible for AI vision, ~55% smaller upload
+    final compressedBytes = img.encodeJpg(image, quality: 60);
     
     // Create a new file for the compressed image to avoid path conflict
     int dotIndex = path.lastIndexOf('.');

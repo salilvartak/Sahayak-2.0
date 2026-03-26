@@ -1,11 +1,8 @@
-import 'dart:math' as math;
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/conversation_provider.dart';
 
-/// PART 11 — UI: No interaction model.
-/// Voice IS the interface. All buttons removed except hardware utility controls
-/// (camera flip, flash). The mic area is replaced by a live state indicator.
 class ControlBarWidget extends ConsumerWidget {
   final GlobalKey? micKey;
   final GlobalKey? cameraKey;
@@ -21,6 +18,7 @@ class ControlBarWidget extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(conversationProvider);
+    final status = state.status;
     final isFlashOn = state.isFlashOn;
 
     return Padding(
@@ -28,17 +26,41 @@ class ControlBarWidget extends ConsumerWidget {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
-          // Camera flip — hardware utility, not interaction
+          // --- Camera Flip Button ---
           _GlassControl(
             key: cameraKey,
             icon: Icons.flip_camera_ios_rounded,
             onTap: () => ref.read(conversationProvider.notifier).switchCamera(),
           ),
 
-          // State indicator — replaces PTT mic button
-          _VoiceStateIndicator(key: micKey, status: state.status),
+          // --- PTT Mic Button ---
+          _MicButton(
+            key: micKey,
+            status: status,
+            onLongPressStart: () {
+              final s = ref.read(conversationProvider).status;
+              if (s == AppState.thinking) return;
+              if (s == AppState.speaking) {
+                ref.read(conversationProvider.notifier).stopSpeaking();
+              }
+              ref.read(conversationProvider.notifier).startListening();
+            },
+            onLongPressEnd: () {
+              final s = ref.read(conversationProvider).status;
+              if (s == AppState.listening) {
+                ref.read(conversationProvider.notifier).stopListeningAndProcess();
+              }
+            },
+            onTap: () {
+              final s = ref.read(conversationProvider).status;
+              if (s == AppState.thinking) return;
+              if (s == AppState.speaking) {
+                ref.read(conversationProvider.notifier).stopSpeaking();
+              }
+            },
+          ),
 
-          // Flash toggle — hardware utility
+          // --- Flash Toggle Button ---
           _GlassControl(
             key: flashKey,
             icon: isFlashOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
@@ -52,182 +74,7 @@ class ControlBarWidget extends ConsumerWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Voice State Indicator — animated circle showing current pipeline state
-// ---------------------------------------------------------------------------
-
-class _VoiceStateIndicator extends StatefulWidget {
-  final AppVoiceState status;
-
-  const _VoiceStateIndicator({super.key, required this.status});
-
-  @override
-  State<_VoiceStateIndicator> createState() => _VoiceStateIndicatorState();
-}
-
-class _VoiceStateIndicatorState extends State<_VoiceStateIndicator>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _ctrl;
-  late Animation<double> _pulseAnim;
-
-  @override
-  void initState() {
-    super.initState();
-    _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    )..repeat(reverse: true);
-    _pulseAnim = Tween<double>(begin: 0.88, end: 1.0).animate(
-      CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut),
-    );
-  }
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final (icon, color, shouldPulse) = _stateVisual(widget.status);
-
-    return AnimatedBuilder(
-      animation: _pulseAnim,
-      builder: (context, _) {
-        final scale = shouldPulse ? _pulseAnim.value : 1.0;
-        return Transform.scale(
-          scale: scale,
-          child: Container(
-            width: 84,
-            height: 84,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: color.withValues(alpha: 0.12),
-              border: Border.all(color: color.withValues(alpha: 0.35), width: 1.5),
-              boxShadow: shouldPulse
-                  ? [
-                      BoxShadow(
-                        color: color.withValues(alpha: 0.25),
-                        blurRadius: 18,
-                        spreadRadius: 2,
-                      )
-                    ]
-                  : [],
-            ),
-            child: _buildInnerContent(widget.status, icon, color),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildInnerContent(
-      AppVoiceState status, IconData icon, Color color) {
-    // Waveform for capturing
-    if (status == AppVoiceState.capturing) {
-      return Center(child: _MiniWaveform(color: color));
-    }
-    // Spinner for thinking/transcribing
-    if (status == AppVoiceState.thinking ||
-        status == AppVoiceState.transcribing) {
-      return Center(
-        child: SizedBox(
-          width: 28,
-          height: 28,
-          child: CircularProgressIndicator(
-            strokeWidth: 2,
-            valueColor: AlwaysStoppedAnimation<Color>(color),
-          ),
-        ),
-      );
-    }
-    return Center(child: Icon(icon, color: color, size: 34));
-  }
-
-  (IconData, Color, bool) _stateVisual(AppVoiceState status) {
-    switch (status) {
-      case AppVoiceState.listening:
-        return (Icons.graphic_eq_rounded, const Color(0xFF6C8EFF), true);
-      case AppVoiceState.capturing:
-        return (Icons.mic_rounded, const Color(0xFF6C8EFF), true);
-      case AppVoiceState.transcribing:
-        return (Icons.transcribe_rounded, const Color(0xFFB06EFB), true);
-      case AppVoiceState.thinking:
-        return (Icons.psychology_rounded, const Color(0xFFB06EFB), true);
-      case AppVoiceState.streaming:
-      case AppVoiceState.speaking:
-        return (Icons.volume_up_rounded, const Color(0xFF5ECFB1), true);
-      case AppVoiceState.interrupted:
-        return (Icons.bolt_rounded, Colors.orange, true);
-      case AppVoiceState.error:
-        return (Icons.error_outline_rounded, Colors.redAccent, false);
-      case AppVoiceState.idle:
-        return (Icons.mic_none_rounded, Colors.white30, false);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Mini waveform — shown inside indicator during capturing state
-// ---------------------------------------------------------------------------
-
-class _MiniWaveform extends StatefulWidget {
-  final Color color;
-  const _MiniWaveform({required this.color});
-
-  @override
-  State<_MiniWaveform> createState() => _MiniWaveformState();
-}
-
-class _MiniWaveformState extends State<_MiniWaveform>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _ctrl;
-
-  @override
-  void initState() {
-    super.initState();
-    _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 600),
-    )..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _ctrl,
-      builder: (context2, child) {
-        return Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: List.generate(5, (i) {
-            final phase =
-                math.sin((i / 5) * math.pi + _ctrl.value * math.pi).abs();
-            final h = 6.0 + phase * 22;
-            return Container(
-              margin: const EdgeInsets.symmetric(horizontal: 2),
-              width: 3,
-              height: h,
-              decoration: BoxDecoration(
-                color: widget.color.withValues(alpha: (0.6 + phase * 0.4).clamp(0.0, 1.0)),
-                borderRadius: BorderRadius.circular(2),
-              ),
-            );
-          }),
-        );
-      },
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Glass Control — camera flip, flash
+// Premium Glass Control Circle — used for auxiliary buttons
 // ---------------------------------------------------------------------------
 
 class _GlassControl extends StatelessWidget {
@@ -252,18 +99,173 @@ class _GlassControl extends StatelessWidget {
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           color: isActive
-              ? Colors.white.withValues(alpha: 0.2)
-              : Colors.white.withValues(alpha: 0.08),
+              ? Colors.white.withOpacity(0.2)
+              : Colors.white.withOpacity(0.08),
           border: Border.all(
             color: isActive
-                ? Colors.white.withValues(alpha: 0.4)
-                : Colors.white.withValues(alpha: 0.12),
+                ? Colors.white.withOpacity(0.4)
+                : Colors.white.withOpacity(0.12),
           ),
         ),
         child: Icon(
           icon,
           color: isActive ? Colors.white : Colors.white70,
           size: 22,
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PTT Mic Button
+// Blue   = listening
+// Purple = thinking (locked — no interaction)
+// Green  = speaking
+// Orange = interrupt flash (brief, on press during speaking)
+// ---------------------------------------------------------------------------
+
+class _MicButton extends StatefulWidget {
+  final AppState status;
+  final VoidCallback onLongPressStart;
+  final VoidCallback onLongPressEnd;
+  final VoidCallback onTap;
+
+  const _MicButton({
+    super.key,
+    required this.status,
+    required this.onLongPressStart,
+    required this.onLongPressEnd,
+    required this.onTap,
+  });
+
+  @override
+  State<_MicButton> createState() => _MicButtonState();
+}
+
+class _MicButtonState extends State<_MicButton>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _scaleController;
+  late Animation<double> _scaleAnimation;
+
+  bool _interrupted = false;
+  bool _didStartListening = false;
+  Timer? _interruptTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _scaleController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 150),
+    );
+    _scaleAnimation = Tween<double>(begin: 1.0, end: 1.2).animate(
+      CurvedAnimation(parent: _scaleController, curve: Curves.easeOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _interruptTimer?.cancel();
+    _scaleController.dispose();
+    super.dispose();
+  }
+
+  void _flashInterrupt() {
+    _interruptTimer?.cancel();
+    setState(() => _interrupted = true);
+    _interruptTimer = Timer(const Duration(milliseconds: 450), () {
+      if (mounted) setState(() => _interrupted = false);
+    });
+  }
+
+  Color get _strokeColor {
+    if (_interrupted) return const Color(0xFFFF8C42);
+    switch (widget.status) {
+      case AppState.listening:
+        return const Color(0xFF6C8EFF); // blue
+      case AppState.thinking:
+        return const Color(0xFFB06EFB); // purple
+      case AppState.speaking:
+        return const Color(0xFF5ECFB1); // green
+      default:
+        return Colors.white.withOpacity(0.2);
+    }
+  }
+
+  bool get _isActive =>
+      _interrupted ||
+      (widget.status != AppState.idle && widget.status != AppState.error);
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _strokeColor;
+    final active = _isActive;
+    final isThinking = widget.status == AppState.thinking;
+
+    return GestureDetector(
+      onLongPressStart: (_) {
+        if (isThinking) return;
+        _scaleController.forward();
+        if (widget.status == AppState.speaking) _flashInterrupt();
+        _didStartListening = true;
+        widget.onLongPressStart();
+      },
+      onLongPressEnd: (_) {
+        if (!_didStartListening) return;
+        _didStartListening = false;
+        _scaleController.reverse();
+        widget.onLongPressEnd();
+      },
+      onTap: () {
+        if (isThinking) return;
+        if (widget.status == AppState.speaking) _flashInterrupt();
+        widget.onTap();
+      },
+      child: AnimatedBuilder(
+        animation: _scaleAnimation,
+        builder: (context, child) => Transform.scale(
+          scale: _scaleAnimation.value,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeInOut,
+            width: 84,
+            height: 84,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: active
+                    ? [color.withOpacity(0.45), color.withOpacity(0.2)]
+                    : [
+                        Colors.white.withOpacity(0.15),
+                        Colors.white.withOpacity(0.05),
+                      ],
+              ),
+              boxShadow: active
+                  ? [
+                      BoxShadow(
+                        color: color.withOpacity(0.45),
+                        blurRadius: 22,
+                        spreadRadius: 4,
+                      )
+                    ]
+                  : [],
+              border: Border.all(color: color, width: 2.0),
+            ),
+            child: Center(
+              child: Icon(
+                isThinking
+                    ? Icons.hourglass_top_rounded
+                    : (widget.status == AppState.speaking
+                        ? Icons.stop_rounded
+                        : Icons.mic_rounded),
+                color: isThinking ? color : Colors.white,
+                size: 36,
+              ),
+            ),
+          ),
         ),
       ),
     );

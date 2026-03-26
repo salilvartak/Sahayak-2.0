@@ -126,16 +126,7 @@ class TTSService {
   }
 
   String _getLanguageCode(Language language) {
-    switch (language) {
-      case Language.hindi:
-        return 'hi-IN';
-      case Language.marathi:
-        return 'mr-IN';
-      case Language.telugu:
-        return 'te-IN';
-      case Language.english:
-        return 'en-US';
-    }
+    return language.bcp47;
   }
 
   void setSpeed(String speed) {

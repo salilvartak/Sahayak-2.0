@@ -1,4 +1,4 @@
-import json
+import asyncio
 from services.graph_client import graph_client
 from services.cosmos_client import cosmos_client
 
@@ -36,11 +36,11 @@ class MemoryPipeline:
     async def build_routing_context(self, user_id: str, session_id: str, query: str):
         """Fetch all signals from Neo4j for the Smart Router."""
         try:
-            # 1. Fetch graph context (topics, entities)
-            context_data = await graph_client.get_related_context(user_id, query)
-            
-            # 2. Fetch session metrics (depth, continuity)
-            metrics = await graph_client.get_routing_signals(session_id)
+            # Fetch graph context and session metrics in parallel
+            context_data, metrics = await asyncio.gather(
+                graph_client.get_related_context(user_id, query),
+                graph_client.get_routing_signals(session_id),
+            )
             
             # 3. Construct the router-ready memory object
             # Note: inferred_domain and expertise_hint would ideally come from 

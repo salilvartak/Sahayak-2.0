@@ -37,10 +37,10 @@ async def get_history(
             # Map robustly to catch both OLD and NEW data formats
             history_items.append(HistoryItem(
                 interaction_id=item.get("id", ""),
-                query=item.get("user_message") or item.get("query", ""),
-                response=item.get("ai_response") or item.get("response", "No response"),
-                language=item.get("language", "en"),
-                timestamp=item.get("timestamp", ""),
+                query=item.get("user_message") or item.get("query") or "",
+                response=item.get("ai_response") or item.get("response") or "",
+                language=item.get("language") or "en",
+                timestamp=item.get("timestamp") or "",
                 image_url=image_url
             ))
             

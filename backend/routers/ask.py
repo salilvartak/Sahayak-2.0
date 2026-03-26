@@ -1,8 +1,11 @@
 import uuid
+import asyncio
 from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi.responses import StreamingResponse
 from services.agent import agent_graph
 from services.blob_service import blob_service
 from services.cosmos_client import cosmos_client
+from services.azure_ai_service import azure_ai_service
 from models.schemas import AskResponse
 
 router = APIRouter()
@@ -43,7 +46,7 @@ async def ask(
             
     try:
         # 0. Get the previous interaction ID for this session to maintain history chain
-        prev_interaction_id = await cosmos_client.get_last_interaction_id(session_id)
+        prev_interaction_id = await cosmos_client.get_last_interaction_id(device_id, session_id)
         
         # Prepare state for LangGraph pipeline
         state = {
@@ -77,3 +80,79 @@ async def ask(
     except Exception as e:
         print(f"Error in /ask end-point: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ask/stream")
+async def ask_stream(
+    background_tasks: BackgroundTasks,
+    device_id: str = Form(...),
+    session_id: str = Form("default"),
+    query: str = Form(...),
+    language: str = Form(...),
+    image: UploadFile = File(None),
+    was_interruption: bool = Form(False),
+    partial_response: str = Form(""),
+    previous_intent: str = Form(""),
+):
+    """SSE streaming endpoint — yields plain-text tokens as they arrive from the
+    LLM so the Flutter client can pipe each sentence to TTS immediately, giving
+    the user speech ~1–2 s after they stop talking instead of waiting for the
+    full response."""
+    interaction_id = str(uuid.uuid4())
+    image_bytes = None
+    blob_name = None
+
+    if image:
+        try:
+            image_bytes = await image.read()
+            blob_name = f"{device_id}/{interaction_id}/frame.jpg"
+            background_tasks.add_task(
+                blob_service.upload_image, device_id, interaction_id, image_bytes
+            )
+        except Exception as e:
+            print(f"[ask/stream] Error reading image: {e}")
+            raise HTTPException(status_code=400, detail="Could not read image file")
+
+    prev_interaction_id = await cosmos_client.get_last_interaction_id(device_id, session_id)
+
+    state = {
+        "user_id": device_id,
+        "session_id": session_id,
+        "interaction_id": interaction_id,
+        "query": query,
+        "language": language,
+        "image_bytes": image_bytes,
+        "blob_name": blob_name,
+        "metadata": {"user_id": device_id},
+        "prev_interaction_id": prev_interaction_id,
+        "was_interruption": was_interruption,
+        "partial_response": partial_response,
+        "previous_intent": previous_intent,
+        "response_text": "",
+        "extracted_memory": {},
+    }
+    print(f"[ask/stream] query='{query}' | language='{language}' | image={'yes' if image_bytes else 'no'}", flush=True)
+
+    from services.agent import build_streaming_context, history_write_node
+
+    model, system_prompt_text = await build_streaming_context(state)
+
+    full_response: list[str] = []
+
+    async def generate():
+        async for token in azure_ai_service.stream_text(
+            prompt=query,
+            image_bytes=image_bytes,
+            language_name=language,
+            system_prompt_text=system_prompt_text,
+            model=model,
+        ):
+            full_response.append(token)
+            yield f"data: {token}\n\n"
+
+        # Stream complete — persist to Cosmos + Neo4j in background
+        state["response_text"] = "".join(full_response)
+        asyncio.create_task(history_write_node(state))
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")

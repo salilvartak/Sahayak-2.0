@@ -2,11 +2,11 @@ from typing import TypedDict, Annotated, List, Optional
 import json
 import uuid
 from langgraph.graph import StateGraph, END
-from services.router_service import router_service
 from services.azure_ai_service import azure_ai_service
 from services.cosmos_client import cosmos_client
 from services.memory_pipeline import memory_pipeline
 from services.graph_client import graph_client
+from prompts import system_prompt as sp
 
 # Define the state for the LangGraph pipeline
 class AgentState(TypedDict):
@@ -26,39 +26,110 @@ class AgentState(TypedDict):
     partial_response: Optional[str]
     previous_intent: Optional[str]
 
-# --- Nodes ---
+# --- Python-based routing (no LLM round-trip) ---
 
-async def call_llm_node(state: AgentState):
-    """Router-based LLM node that picks the best model and generates the final response."""
-    
-    # 1. Fetch memory context and signals from Neo4j
+def _route_request(state: AgentState, routing_context: dict, streaming: bool = False) -> tuple:
+    """Select model and build enriched prompt without an extra LLM call.
+
+    streaming=True uses the plain-text base prompt (no JSON output format),
+    suitable for the streaming SSE pipeline.
+    """
+    depth = routing_context.get("session_depth", 0)
+    continuity = routing_context.get("continuity_score", 0.0)
+    has_image = state.get("image_bytes") is not None
+    language = state.get("language", "en")
+    is_non_english = not language.startswith("en")
+    query_words = len((state.get("query") or "").split())
+
+    # Weighted routing score
+    score = 0
+    score += 20 if depth >= 5 else (12 if depth >= 3 else 5)
+    score += int(continuity * 20)
+    score += 20 if query_words > 15 else 5
+    score += 15 if has_image else 0
+    score += 10 if is_non_english else 0
+
+    # Model selection: always gpt-4o when image present or high complexity
+    model = "gpt-4o" if (has_image or score >= 40) else "gpt-4o-mini"
+
+    # Build enriched system prompt = base + optional memory context block
+    lang_cap = language.capitalize() if language else "English"
+    if streaming:
+        base_prompt = sp.get_system_prompt(lang_cap)
+    else:
+        base_prompt = sp.get_structured_system_prompt(lang_cap)
+
+    topics = routing_context.get("dominant_topics", [])
+    entities = routing_context.get("entities_mentioned", [])
+    prev_id = state.get("prev_interaction_id")
+
+    if topics or entities or (prev_id and depth > 1):
+        memory_block = "\n\n## User Memory Context\n"
+        if topics:
+            memory_block += f"- Past topics: {', '.join(str(t) for t in topics[:3])}\n"
+        if entities:
+            memory_block += f"- Known entities: {', '.join(str(e) for e in entities[:5])}\n"
+        if prev_id and depth > 1:
+            memory_block += (
+                f"- Continuing conversation ({depth} turns, "
+                f"continuity {continuity:.0%}). Avoid repeating prior explanations.\n"
+            )
+        base_prompt = memory_block + base_prompt
+
+    print(f"[Router] Model: {model} | score={score} | depth={depth} | streaming={streaming} | image={'yes' if has_image else 'no'}")
+    return model, base_prompt
+
+
+async def build_streaming_context(state: AgentState) -> tuple:
+    """Fetch memory context and route for the streaming pipeline.
+
+    Returns (model, plain_text_system_prompt) — no JSON output format,
+    suitable for feeding tokens directly to TTS as they stream.
+    """
     routing_context = await memory_pipeline.build_routing_context(
-        state["user_id"], 
+        state["user_id"],
         state["session_id"],
         state["query"]
     )
-    
-    # 2. Call the Smart Router to get selected_model and enriched_prompt
-    router_resp = await router_service.route_request(state, routing_context)
-    selected_model = router_resp.get("selected_model", "gpt-4o")
-    enriched_prompt = router_resp.get("enriched_system_prompt", "")
+    model, prompt = _route_request(state, routing_context, streaming=True)
 
-    # PART 7 — Inject interrupt context so the LLM can continue naturally
+    # Inject interrupt context if applicable
+    if state.get("was_interruption") and state.get("partial_response"):
+        partial = state["partial_response"][:300]
+        prompt += (
+            "\n\n[INTERRUPT CONTEXT: The user interrupted your previous response. "
+            f"You had said: '{partial}'. "
+            "Continue naturally — acknowledge the interruption only if helpful.]"
+        )
+
+    return model, prompt
+
+
+# --- Nodes ---
+
+async def call_llm_node(state: AgentState):
+    """Fetch memory context, route, then call the workhorse LLM in one pass."""
+
+    # 1. Fetch memory context from Neo4j
+    routing_context = await memory_pipeline.build_routing_context(
+        state["user_id"],
+        state["session_id"],
+        state["query"]
+    )
+
+    # 2. Python-based routing — no extra LLM call
+    selected_model, enriched_prompt = _route_request(state, routing_context)
+
+    # 3. Inject interrupt context if applicable
     if state.get("was_interruption") and state.get("partial_response"):
         partial = state["partial_response"][:300]
         enriched_prompt += (
             "\n\n[INTERRUPT CONTEXT: The user interrupted your previous response. "
             f"You had said: '{partial}'. "
-            "Continue the conversation naturally — acknowledge the interruption "
-            "only if helpful, then address the new request directly.]"
+            "Continue naturally — acknowledge the interruption only if helpful.]"
         )
-        print(f"[Agent] Interrupt context injected. Partial: '{partial[:80]}...'")
-    
-    print(f"[Router] Chosen Model: {selected_model} (Score: {router_resp.get('routing_score')})")
-    
-    # 3. Call the Workhorse model (using the current azure_ai_service but we pass the model name)
-    # Note: Currently azure_ai_service uses a hard-coded endpoint. 
-    # Let's use the enriched system prompt instead of the old one.
+
+    # 4. Single LLM call to the workhorse model
     combined_result = await azure_ai_service.get_response_with_custom_prompt(
         prompt=state["query"],
         image_bytes=state["image_bytes"],
@@ -66,11 +137,27 @@ async def call_llm_node(state: AgentState):
         custom_system_prompt=enriched_prompt,
         model_override=selected_model
     )
-    
+
     return {
         "response_text": combined_result.get("ai_response", "AI could not generate a response."),
         "extracted_memory": combined_result.get("memory", {})
     }
+
+_LANGUAGE_BCP47 = {
+    'hindi':     'hi-IN',
+    'marathi':   'mr-IN',
+    'english':   'en-IN',
+    'telugu':    'te-IN',
+    'tamil':     'ta-IN',
+    'kannada':   'kn-IN',
+    'malayalam': 'ml-IN',
+    'gujarati':  'gu-IN',
+    'punjabi':   'pa-IN',
+    'bengali':   'bn-IN',
+    'odia':      'or-IN',
+    'assamese':  'as-IN',
+    'urdu':      'ur-IN',
+}
 
 async def history_write_node(state: AgentState):
     """
@@ -78,7 +165,14 @@ async def history_write_node(state: AgentState):
     """
     try:
         print(f"DEBUG: Processing history for interaction {state.get('interaction_id')}. Blob: {state.get('blob_name')}")
-        
+
+        # Normalise language to BCP-47 (payload may carry an enum name like 'hindi')
+        raw_lang = state.get("language", "")
+        language_code = (
+            raw_lang if '-' in raw_lang
+            else _LANGUAGE_BCP47.get(raw_lang.lower(), 'hi-IN')
+        )
+
         # 1. Save to Cosmos DB (Primary Interaction Store)
         data = {
             "user_id": state["user_id"],
@@ -86,7 +180,7 @@ async def history_write_node(state: AgentState):
             "interaction_id": state["interaction_id"],
             "user_message": state["query"],
             "ai_response": state["response_text"],
-            "language": state["language"],
+            "language": language_code,
             "blob_name": state.get("blob_name"),
             "metadata": state.get("metadata", {}),
         }

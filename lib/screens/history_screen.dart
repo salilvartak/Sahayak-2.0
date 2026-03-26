@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 import '../providers/conversation_provider.dart';
-import '../providers/settings_provider.dart';
 import '../models/conversation_turn.dart';
 import '../models/language.dart';
 
@@ -15,7 +14,6 @@ class HistoryScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(conversationProvider);
     final history = state.history;
-    const language = Language.english;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -69,7 +67,7 @@ class HistoryScreen extends ConsumerWidget {
                 ? Center(
                     child: Text(
                       'No history yet',
-                      style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 16),
+                      style: TextStyle(color: Colors.white.withValues(alpha: 0.3), fontSize: 16),
                     ),
                   )
                 : ListView.builder(
@@ -95,8 +93,6 @@ class _HistoryCard extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final settings = ref.watch(settingsProvider);
-    const language = Language.english;
     final dateStr = DateFormat('MMM d, h:mm a').format(turn.timestamp);
 
     final bool isNetworkImage = turn.imagePath?.startsWith('http') ?? false;
@@ -110,9 +106,9 @@ class _HistoryCard extends ConsumerWidget {
           child: Container(
             padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.06),
+              color: Colors.white.withValues(alpha: 0.06),
               borderRadius: BorderRadius.circular(24),
-              border: Border.all(color: Colors.white.withOpacity(0.12)),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -123,7 +119,7 @@ class _HistoryCard extends ConsumerWidget {
                     Text(
                       dateStr.toUpperCase(),
                       style: TextStyle(
-                        color: Colors.white.withOpacity(0.3),
+                        color: Colors.white.withValues(alpha: 0.3),
                         fontSize: 10,
                         letterSpacing: 1.5,
                         fontWeight: FontWeight.w600,
@@ -163,13 +159,13 @@ class _HistoryCard extends ConsumerWidget {
                 // Voice Note players instead of text
                 _VoicePlayerBubble(
                   text: turn.query,
-                  language: language,
+                  language: turn.language,
                   isUser: true,
                 ),
                 const SizedBox(height: 12),
                 _VoicePlayerBubble(
                   text: turn.response,
-                  language: language,
+                  language: turn.language,
                   isUser: false,
                 ),
               ],
@@ -185,7 +181,7 @@ class _ImageError extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      color: Colors.white.withOpacity(0.05),
+      color: Colors.white.withValues(alpha: 0.05),
       child: const Icon(Icons.broken_image_rounded, color: Colors.white24, size: 30),
     );
   }
@@ -193,7 +189,7 @@ class _ImageError extends StatelessWidget {
 
 class _VoicePlayerBubble extends ConsumerStatefulWidget {
   final String text;
-  final dynamic language;
+  final String language; // BCP-47 e.g. 'hi-IN'
   final bool isUser;
 
   const _VoicePlayerBubble({
@@ -220,7 +216,7 @@ class _VoicePlayerBubbleState extends ConsumerState<_VoicePlayerBubble> {
           setState(() => _isPlaying = false);
         } else {
           setState(() => _isPlaying = true);
-          await notifier.speak(widget.text, widget.language); 
+          await notifier.speak(widget.text, Language.fromBcp47(widget.language));
           if (mounted) setState(() => _isPlaying = false);
         }
       },
@@ -229,10 +225,10 @@ class _VoicePlayerBubbleState extends ConsumerState<_VoicePlayerBubble> {
         width: double.infinity,
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         decoration: BoxDecoration(
-          color: widget.isUser ? Colors.blueAccent.withOpacity(0.12) : Colors.greenAccent.withOpacity(0.08),
+          color: widget.isUser ? Colors.blueAccent.withValues(alpha: 0.12) : Colors.greenAccent.withValues(alpha: 0.08),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
-            color: widget.isUser ? Colors.blueAccent.withOpacity(0.3) : Colors.greenAccent.withOpacity(0.2),
+            color: widget.isUser ? Colors.blueAccent.withValues(alpha: 0.3) : Colors.greenAccent.withValues(alpha: 0.2),
             width: 1,
           ),
         ),
@@ -241,7 +237,7 @@ class _VoicePlayerBubbleState extends ConsumerState<_VoicePlayerBubble> {
             Container(
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
-                color: widget.isUser ? Colors.blueAccent.withOpacity(0.2) : Colors.greenAccent.withOpacity(0.2),
+                color: widget.isUser ? Colors.blueAccent.withValues(alpha: 0.2) : Colors.greenAccent.withValues(alpha: 0.2),
                 shape: BoxShape.circle,
               ),
               child: Icon(
@@ -281,7 +277,7 @@ class _VoicePlayerBubbleState extends ConsumerState<_VoicePlayerBubble> {
             ),
             Icon(
               widget.isUser ? Icons.person_outline_rounded : Icons.smart_toy_outlined,
-              color: widget.isUser ? Colors.blueAccent.withOpacity(0.4) : Colors.greenAccent.withOpacity(0.3),
+              color: widget.isUser ? Colors.blueAccent.withValues(alpha: 0.4) : Colors.greenAccent.withValues(alpha: 0.3),
               size: 24,
             ),
           ],

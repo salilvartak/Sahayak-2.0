@@ -3,12 +3,14 @@ class ConversationTurn {
   final String response;
   final DateTime timestamp;
   final String? imagePath;
+  final String language; // BCP-47, e.g. 'hi-IN'
 
   ConversationTurn({
     required this.query,
     required this.response,
     required this.timestamp,
     this.imagePath,
+    this.language = 'hi-IN',
   });
 
   Map<String, dynamic> toJson() => {

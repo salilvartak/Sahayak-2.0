@@ -1,63 +1,47 @@
-import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../models/conversation_turn.dart';
-import '../services/camera_service.dart';
-import '../services/tts_service.dart';
-import '../utils/image_utils.dart';
-import 'package:permission_handler/permission_handler.dart';
-import '../models/language.dart';
-import 'settings_provider.dart';
-import '../localization/app_localizations.dart';
-import '../services/backend_service.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../services/vad_controller.dart';
-import '../services/vad_pipeline.dart';
-import '../services/azure_streaming_client.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+import '../models/conversation_turn.dart';
+import '../models/language.dart';
+import '../services/camera_service.dart';
+import '../services/tts_service.dart';
+import '../services/backend_service.dart';
+import '../services/azure_speech_service.dart';
+import '../utils/image_utils.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'settings_provider.dart';
+import '../localization/app_localizations.dart';
 
-// PART 5 — Full state machine
-enum AppVoiceState {
-  idle,
-  listening,   // Always-on mic active, waiting for speech
-  capturing,   // Speech detected, streaming to STT
-  transcribing, // 750ms silence, awaiting final STT result
-  thinking,    // STT done, LLM processing
-  streaming,   // TTS actively speaking response sentence-by-sentence
-  speaking,    // Alias kept for legacy widget compatibility
-  error,
-  interrupted, // User spoke while AI was talking (brief flash)
-}
+enum AppState { idle, listening, thinking, speaking, error }
 
 class ConversationState {
-  final AppVoiceState status;
+  final AppState status;
   final String lastResponse;
   final List<ConversationTurn> history;
   final bool isFlashOn;
-  final Map<String, int> latencyMs; // Observability
 
   const ConversationState({
-    this.status = AppVoiceState.idle,
+    this.status = AppState.idle,
     this.lastResponse = '',
     this.history = const [],
     this.isFlashOn = false,
-    this.latencyMs = const {},
   });
 
   ConversationState copyWith({
-    AppVoiceState? status,
+    AppState? status,
     String? lastResponse,
     List<ConversationTurn>? history,
     bool? isFlashOn,
-    Map<String, int>? latencyMs,
   }) {
     return ConversationState(
       status: status ?? this.status,
       lastResponse: lastResponse ?? this.lastResponse,
       history: history ?? this.history,
       isFlashOn: isFlashOn ?? this.isFlashOn,
-      latencyMs: latencyMs ?? this.latencyMs,
     );
   }
 }
@@ -71,184 +55,15 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
   final Ref _ref;
   final CameraService _cameraService = CameraService();
   final AudioRecorder _recorder = AudioRecorder();
+  final AzureSpeechService _azureSpeechService = AzureSpeechService();
   final TTSService _ttsService = TTSService();
   final BackendService _backendService = BackendService();
-  final VadController _vadController = VadController();
-  late final VadPipeline _vadPipeline;
 
+  String? _recordingPath;
   Language _detectedLanguage = Language.english;
-
-  StreamSubscription<Uint8List>? _audioStreamSub;
-  AzureStreamingClient? _streamingClient;
-
-  // PART 5 — Interrupt + context tracking
-  int _requestGeneration = 0; // Increment to invalidate stale LLM responses
-  String _partialResponse = ''; // What AI had said before being interrupted
-  final String _lastIntent = '';
-  bool _wasInterruption = false;
   String _currentSessionId = 'default';
 
-  // PART 10 — Latency stopwatches
-  final Stopwatch _captureWatch = Stopwatch();
-  final Stopwatch _llmWatch = Stopwatch();
-  final Stopwatch _ttsWatch = Stopwatch();
-
-  ConversationNotifier(this._ref) : super(const ConversationState()) {
-    _vadPipeline = VadPipeline(
-      vadController: _vadController,
-      onStateChanged: _onVadStateChanged,
-      onAudioCaptured: _onVadAudioCaptured,
-    );
-
-    // Wire up TTS completion callbacks
-    _ttsService.onSentenceStarted = _onTtsSentenceStarted;
-    _ttsService.onAllCompleted = _onTtsAllCompleted;
-
-    initialize();
-  }
-
-  // ---------------------------------------------------------------------------
-  // PART 10 — Observability helpers
-  // ---------------------------------------------------------------------------
-
-  void _logTransition(AppVoiceState from, AppVoiceState to) {
-    debugPrint('[STATE] ${from.name} → ${to.name}');
-  }
-
-  void _setState(
-    AppVoiceState newStatus, {
-    String? lastResponse,
-    List<ConversationTurn>? history,
-    bool? isFlashOn,
-    Map<String, int>? latencyMs,
-  }) {
-    _logTransition(state.status, newStatus);
-    state = state.copyWith(
-      status: newStatus,
-      lastResponse: lastResponse,
-      history: history,
-      isFlashOn: isFlashOn,
-      latencyMs: latencyMs,
-    );
-  }
-
-  // ---------------------------------------------------------------------------
-  // TTS Callbacks
-  // ---------------------------------------------------------------------------
-
-  void _onTtsSentenceStarted() {
-    if (state.status != AppVoiceState.streaming) {
-      _setState(AppVoiceState.streaming);
-    }
-  }
-
-  void _onTtsAllCompleted() {
-    _ttsWatch.stop();
-    debugPrint('[Latency] TTS total: ${_ttsWatch.elapsedMilliseconds}ms');
-    _vadController.onTtsStopped();
-    if (mounted) {
-      _setState(AppVoiceState.listening);
-      _vadPipeline.reset();
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // PART 5 — VAD → State Machine
-  // ---------------------------------------------------------------------------
-
-  void _onVadStateChanged(bool isSpeaking) {
-    if (isSpeaking) {
-      final current = state.status;
-
-      // Interrupt only while TTS is actively speaking
-      if (current == AppVoiceState.streaming ||
-          current == AppVoiceState.speaking) {
-        _handleInterrupt();
-        return;
-      }
-
-      // Only begin capture from listening state
-      if (current != AppVoiceState.listening) return;
-
-      _setState(AppVoiceState.capturing);
-      _captureWatch.reset();
-      _captureWatch.start();
-
-      // Start real-time STT WebSocket immediately
-      _streamingClient?.stopStream();
-      _streamingClient = AzureStreamingClient(
-        onPartialResult: (text) => debugPrint('[STT] Partial: $text'),
-        onFinalResult: _processFinalSttText,
-        onError: (e) {
-          debugPrint('[STT] WS error: $e');
-          // Retry WebSocket on transient error
-          if (state.status == AppVoiceState.capturing && mounted) {
-            Future.delayed(const Duration(milliseconds: 500), () {
-              if (state.status == AppVoiceState.capturing && mounted) {
-                debugPrint('[STT] Retrying WebSocket');
-                _streamingClient = AzureStreamingClient(
-                  onPartialResult: (t) => debugPrint('[STT] Partial: $t'),
-                  onFinalResult: _processFinalSttText,
-                  onError: (e2) => debugPrint('[STT] Retry failed: $e2'),
-                )..startStream(language: 'en-US');
-              }
-            });
-          }
-        },
-      )..startStream(language: 'en-US');
-    } else {
-      // 750ms silence → end capture only if we were capturing
-      if (state.status != AppVoiceState.capturing) return;
-
-      _captureWatch.stop();
-      debugPrint('[Latency] Capture: ${_captureWatch.elapsedMilliseconds}ms');
-      _setState(AppVoiceState.transcribing);
-      _streamingClient?.stopStream(); // Closing forces Azure to emit final phrase
-    }
-  }
-
-  // PART 5 — Interrupt logic
-  void _handleInterrupt() {
-    debugPrint('[INTERRUPT] User interrupted at state=${state.status.name}');
-
-    _partialResponse = state.lastResponse; // Save what AI had spoken
-    _wasInterruption = true;
-    ++_requestGeneration; // Invalidate any in-flight LLM request
-
-    _ttsService.stop();
-    _vadController.onTtsStopped();
-    _ttsWatch.stop();
-
-    // Start new STT stream immediately so we don't lose the interrupt utterance
-    _streamingClient?.stopStream();
-    _streamingClient = AzureStreamingClient(
-      onPartialResult: (t) => debugPrint('[STT] Interrupt partial: $t'),
-      onFinalResult: _processFinalSttText,
-      onError: (e) => debugPrint('[STT] Interrupt WS error: $e'),
-    )..startStream(language: 'en-US');
-
-    // Flash the interrupted state briefly, then move to capturing
-    _setState(AppVoiceState.interrupted);
-    _captureWatch.reset();
-    _captureWatch.start();
-
-    Future.delayed(const Duration(milliseconds: 150), () {
-      if (mounted && state.status == AppVoiceState.interrupted) {
-        _setState(AppVoiceState.capturing);
-      }
-    });
-  }
-
-  void _onVadAudioCaptured(Uint8List frame) {
-    if (state.status == AppVoiceState.capturing ||
-        state.status == AppVoiceState.interrupted) {
-      _streamingClient?.sendAudioChunk(frame);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Public API
-  // ---------------------------------------------------------------------------
+  ConversationNotifier(this._ref) : super(const ConversationState());
 
   CameraService get cameraService => _cameraService;
 
@@ -256,270 +71,297 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
     try {
       final deviceId = await _getDeviceId();
       _currentSessionId = '${deviceId}_${DateTime.now().millisecondsSinceEpoch}';
-      debugPrint('[Init] device=$deviceId session=$_currentSessionId');
 
-      final items = await _backendService.getHistory(deviceId);
-      final history = items.map((item) => ConversationTurn(
-            query: item['query'] ?? '',
-            response: item['response'] ?? '',
-            timestamp:
-                DateTime.tryParse(item['timestamp'] ?? '') ?? DateTime.now(),
-            imagePath: item['image_url'],
-          )).toList();
-
-      state = state.copyWith(history: history);
+      try {
+        final items = await _backendService.getHistory(deviceId);
+        final history = items.map((item) => ConversationTurn(
+              query: item['query'] ?? '',
+              response: item['response'] ?? '',
+              timestamp:
+                  DateTime.tryParse(item['timestamp'] ?? '') ?? DateTime.now(),
+              imagePath: item['image_url'],
+              language: item['language'] as String? ?? 'hi-IN',
+            )).toList();
+        state = state.copyWith(history: history);
+      } catch (e) {
+        debugPrint('[Init] History load failed (non-fatal): $e');
+      }
 
       final cameraStatus = await Permission.camera.request();
       final micStatus = await Permission.microphone.request();
 
       if (!cameraStatus.isGranted || !micStatus.isGranted) {
-        _setState(AppVoiceState.error);
-        const lang = Language.english;
+        state = state.copyWith(status: AppState.error);
+        const language = Language.english;
+        final localizations = AppLocalizations(language);
         await _ttsService.speak(
-            AppLocalizations(lang).translate('permission_error'), lang);
+            localizations.translate('permission_error'), language);
         return;
       }
 
       try {
         await _cameraService.initialize();
+        state = state.copyWith();
       } catch (e) {
-        debugPrint('[Init] Camera failed: $e');
-        _setState(AppVoiceState.error);
-        const lang = Language.english;
+        debugPrint('[Init] Camera initialization failed: $e');
+        state = state.copyWith(status: AppState.error);
+        const language = Language.english;
+        final localizations = AppLocalizations(language);
         await _ttsService.speak(
-            AppLocalizations(lang).translate('camera_error'), lang);
+            localizations.translate('camera_error'), language);
         return;
       }
 
       final settings = _ref.read(settingsProvider);
       if (settings.tutorialCompleted) {
-        const lang = Language.english;
+        const language = Language.english;
+        final localizations = AppLocalizations(language);
         await _ttsService.speak(
-            AppLocalizations(lang).translate('welcome_message'), lang);
+            localizations.translate('welcome_message'), language);
       }
 
-      // PART 5 — Auto-start always-on listening (no PTT needed)
-      await startListening();
+      state = state.copyWith();
     } catch (e) {
       debugPrint('[Init] Error: $e');
-      _setState(AppVoiceState.error);
+      state = state.copyWith(status: AppState.error);
     }
+  }
+
+  Future<void> speak(String text, dynamic language) async {
+    await _ttsService.speak(text, language);
   }
 
   Future<void> startListening() async {
     try {
-      if (!await _recorder.hasPermission()) return;
-      if (state.status == AppVoiceState.listening) return; // Already active
+      if (await _recorder.hasPermission()) {
+        final directory = await getTemporaryDirectory();
+        _recordingPath = p.join(directory.path, 'audio_capture.wav');
 
-      _setState(AppVoiceState.listening);
-      _audioStreamSub?.cancel();
+        state = state.copyWith(status: AppState.listening);
 
-      final stream = await _recorder.startStream(
-        const RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          sampleRate: 16000,
-          numChannels: 1,
-          echoCancel: true,   // Layer 1: hardware AEC
-          noiseSuppress: true,
-          autoGain: true,
-        ),
-      );
-
-      _audioStreamSub = stream.listen((data) => _vadPipeline.feedAudio(data));
-      debugPrint('[Mic] Always-on listening started');
+        await _recorder.start(
+          const RecordConfig(
+            encoder: AudioEncoder.wav,
+            sampleRate: 16000,
+            numChannels: 1,
+          ),
+          path: _recordingPath!,
+        );
+      }
     } catch (e) {
       debugPrint('[Mic] Start error: $e');
-      _setState(AppVoiceState.error);
+      state = state.copyWith(status: AppState.error);
     }
   }
 
-  Future<void> processTextQuery(String query, Language language) async {
-    _setState(AppVoiceState.thinking);
-    final myGeneration = ++_requestGeneration;
+  Future<void> stopListeningAndProcess() async {
+    final String? path = await _recorder.stop();
+    if (path == null) {
+      state = state.copyWith(status: AppState.idle);
+      return;
+    }
+    state = state.copyWith(status: AppState.thinking);
 
     try {
-      final xFile = await _cameraService.captureFrame();
-      if (xFile == null) throw Exception('Camera capture failed');
-      final compressed = await ImageUtils.compressImage(xFile.path);
+      // Parallel: capture+compress image AND transcribe audio
+      final captureTask = _captureAndCompress();
+      final sttTask = _azureSpeechService.recognize(path);
+      final compressedFile = await captureTask;
+      final sttResult = await sttTask;
+
+      final transcript =
+          sttResult.transcript.isNotEmpty ? sttResult.transcript : 'What is this?';
+      _detectedLanguage = Language.fromBcp47(sttResult.language);
+
       final deviceId = await _getDeviceId();
-
-      _llmWatch.reset();
-      _llmWatch.start();
-
-      final resp = await _backendService.getResponse(
-        deviceId: deviceId,
-        query: query,
-        imageFile: File(compressed.path),
-        language: language,
-        sessionId: _currentSessionId,
-      );
-
-      _llmWatch.stop();
-      debugPrint('[Latency] LLM: ${_llmWatch.elapsedMilliseconds}ms');
-
-      if (_requestGeneration != myGeneration) {
-        debugPrint('[State] Stale text query response discarded');
-        return;
-      }
-
-      debugPrint('[Context] interaction_id=${resp.interactionId}');
-      final newTurn = ConversationTurn(
-        query: query,
-        response: resp.response,
-        timestamp: DateTime.now(),
-        imagePath: null,
-      );
-
-      _setState(AppVoiceState.streaming,
-          lastResponse: resp.response,
-          history: [newTurn, ...state.history]);
-
       final settings = _ref.read(settingsProvider);
       _ttsService.setSpeed(settings.voiceSpeed);
-      _vadController.onTtsStarted();
-      _ttsWatch.reset();
-      _ttsWatch.start();
-      await _ttsService.speakStreaming(resp.response, language);
-    } catch (e) {
-      debugPrint('[Error] processTextQuery: $e');
-      _setState(AppVoiceState.error);
+
+      // --- Streaming TTS pipeline ---
+      bool speakingStarted = false;
+      bool streamingDone = false;
+      final fullResponse = StringBuffer();
+      final sentenceBuffer = StringBuffer();
+
+      // When TTS queue drains AND stream is done → go idle
+      _ttsService.onAllCompleted = () {
+        if (streamingDone && mounted) {
+          _ttsService.onAllCompleted = null;
+          state = state.copyWith(status: AppState.idle);
+        }
+      };
+
+      void flushSentence(String sentence) {
+        if (sentence.isEmpty) return;
+        if (!speakingStarted) {
+          speakingStarted = true;
+          state = state.copyWith(status: AppState.speaking);
+        }
+        _ttsService.speakStreaming(sentence, _detectedLanguage).ignore();
+      }
+
+      // Sentence-boundary regex: split after . ! ? । followed by whitespace
+      final sentenceBoundary = RegExp(r'(?<=[.!?।])\s+');
+
+      await for (final token in _backendService.streamResponse(
+        deviceId: deviceId,
+        query: transcript,
+        imageFile: compressedFile,
+        language: _detectedLanguage,
+        sessionId: _currentSessionId,
+      )) {
+        fullResponse.write(token);
+        sentenceBuffer.write(token);
+
+        final text = sentenceBuffer.toString();
+        final match = sentenceBoundary.firstMatch(text);
+        if (match != null) {
+          flushSentence(text.substring(0, match.end).trim());
+          sentenceBuffer
+            ..clear()
+            ..write(text.substring(match.end));
+        }
+      }
+
+      // Flush any remaining text after stream ends
+      flushSentence(sentenceBuffer.toString().trim());
+      streamingDone = true;
+
+      // Add to history
+      final responseText = fullResponse.toString();
+      final newTurn = ConversationTurn(
+        query: transcript,
+        response: responseText,
+        timestamp: DateTime.now(),
+        imagePath: null,
+        language: sttResult.language,
+      );
+      state = state.copyWith(
+        lastResponse: responseText,
+        history: [newTurn, ...state.history],
+      );
+
+      // If nothing was spoken or TTS already finished, go idle now
+      if (!speakingStarted || _ttsService.isIdle) {
+        _ttsService.onAllCompleted = null;
+        state = state.copyWith(status: AppState.idle);
+      }
+    } catch (e, stackTrace) {
+      debugPrint('[Error] stopListeningAndProcess: $e');
+      debugPrint('$stackTrace');
+      _ttsService.onAllCompleted = null;
+      state = state.copyWith(status: AppState.error);
+      const language = Language.english;
+      final localizations = AppLocalizations(language);
+
+      String errorKey = 'connection_error';
+      if (e.toString().contains('Camera')) {
+        errorKey = 'camera_error';
+      } else if (e.toString().contains('API Error')) {
+        errorKey = 'api_error';
+      } else if (e is SocketException) {
+        errorKey = 'connection_error';
+      }
+
+      await _ttsService.speak(localizations.translate(errorKey), language);
+
       Future.delayed(const Duration(seconds: 4), () {
-        if (mounted) _setState(AppVoiceState.listening);
+        if (mounted) state = state.copyWith(status: AppState.idle);
       });
     }
   }
 
-  // Legacy blocking speak (tutorial, welcome message)
-  Future<void> speak(String text, dynamic language) async {
-    _vadController.onTtsStarted();
-    await _ttsService.speak(text, language);
-    _vadController.onTtsStopped();
+  /// Capture a camera frame and compress it in a background isolate.
+  /// Returns null if the camera is unavailable (non-fatal — backend handles
+  /// null image gracefully).
+  Future<File?> _captureAndCompress() async {
+    try {
+      final xFile = await _cameraService.captureFrame();
+      if (xFile == null) return null;
+      return await ImageUtils.compressImage(xFile.path);
+    } catch (e) {
+      debugPrint('[Capture] Failed (non-fatal): $e');
+      return null;
+    }
   }
 
-  Future<void> _processFinalSttText(
-      String transcript, String languageCode) async {
-    if (transcript.isEmpty || transcript.length < 2) {
-      if (mounted) {
-        _setState(AppVoiceState.listening);
-        _vadPipeline.reset();
-      }
-      return;
-    }
-
-    _setState(AppVoiceState.thinking);
-    final myGeneration = ++_requestGeneration;
-    debugPrint('[STT] Final: "$transcript" lang=$languageCode');
+  Future<void> processTextQuery(String query, Language language) async {
+    state = state.copyWith(status: AppState.thinking);
 
     try {
       final xFile = await _cameraService.captureFrame();
       if (xFile == null) throw Exception('Camera capture failed');
-      final compressed = await ImageUtils.compressImage(xFile.path);
 
-      _detectedLanguage = _mapAzureLanguage(languageCode);
+      final compressedFile = await ImageUtils.compressImage(xFile.path);
       final deviceId = await _getDeviceId();
 
-      _llmWatch.reset();
-      _llmWatch.start();
-
-      // PART 7 — Context-aware payload with interrupt fields
       final resp = await _backendService.getResponse(
         deviceId: deviceId,
-        query: transcript,
-        imageFile: File(compressed.path),
-        language: _detectedLanguage,
+        query: query,
+        imageFile: File(compressedFile.path),
+        language: language,
         sessionId: _currentSessionId,
-        wasInterruption: _wasInterruption,
-        partialResponse: _partialResponse,
-        previousIntent: _lastIntent,
       );
 
-      _llmWatch.stop();
-      debugPrint('[Latency] LLM: ${_llmWatch.elapsedMilliseconds}ms');
-
-      // PART 5 — Discard if a newer request has been issued
-      if (_requestGeneration != myGeneration) {
-        debugPrint('[State] Stale LLM response discarded');
-        return;
-      }
-
-      // Reset interrupt context after successful response
-      _wasInterruption = false;
-      _partialResponse = '';
-      debugPrint('[Context] interaction_id=${resp.interactionId}');
-
       final newTurn = ConversationTurn(
-        query: transcript,
+        query: query,
         response: resp.response,
         timestamp: DateTime.now(),
         imagePath: null,
+        language: language.name,
       );
 
-      _setState(
-        AppVoiceState.streaming,
+      state = state.copyWith(
+        status: AppState.speaking,
         lastResponse: resp.response,
         history: [newTurn, ...state.history],
-        latencyMs: {'llm_ms': _llmWatch.elapsedMilliseconds},
       );
 
       final settings = _ref.read(settingsProvider);
       _ttsService.setSpeed(settings.voiceSpeed);
-      _vadController.onTtsStarted();
-      _ttsWatch.reset();
-      _ttsWatch.start();
-      await _ttsService.speakStreaming(resp.response, _detectedLanguage);
+      await _ttsService.speak(resp.response, language);
+
+      state = state.copyWith(status: AppState.idle);
     } catch (e) {
-      debugPrint('[Error] _processFinalSttText: $e');
-      if (_requestGeneration == myGeneration && mounted) {
-        _setState(AppVoiceState.error);
-        Future.delayed(const Duration(seconds: 4), () {
-          if (mounted) {
-            _setState(AppVoiceState.listening);
-            _vadPipeline.reset();
-          }
-        });
-      }
+      debugPrint('[Error] processTextQuery: $e');
+      state = state.copyWith(status: AppState.error);
+      Future.delayed(const Duration(seconds: 4), () {
+        if (mounted) state = state.copyWith(status: AppState.idle);
+      });
     }
   }
 
   void stopSpeaking() {
+    _ttsService.onAllCompleted = null; // Cancel streaming idle-transition handler
     _ttsService.stop();
-    _vadController.onTtsStopped();
-    ++_requestGeneration;
-    _setState(AppVoiceState.listening);
-    _vadPipeline.reset();
+    state = state.copyWith(status: AppState.idle);
   }
 
   void clearResponse() {
-    if (state.status == AppVoiceState.streaming ||
-        state.status == AppVoiceState.speaking) {
+    if (state.status == AppState.speaking) {
       _ttsService.stop();
-      _vadController.onTtsStopped();
     }
-    state = state.copyWith(lastResponse: '', status: AppVoiceState.listening);
+    state = state.copyWith(lastResponse: '', status: AppState.idle);
   }
 
+  /// Press mic to start recording.
+  /// Press again while AI is speaking → interrupt (stop TTS, start new recording).
   void toggleListening() {
     switch (state.status) {
-      case AppVoiceState.streaming:
-      case AppVoiceState.speaking:
+      case AppState.listening:
+        stopListeningAndProcess();
+        break;
+      case AppState.speaking:
+        // Interrupt: stop TTS and immediately start a new recording.
         stopSpeaking();
-        break;
-      case AppVoiceState.thinking:
-        ++_requestGeneration;
-        _setState(AppVoiceState.listening);
-        _vadPipeline.reset();
-        break;
-      case AppVoiceState.listening:
-      case AppVoiceState.capturing:
-        _setState(AppVoiceState.transcribing);
-        _streamingClient?.stopStream();
-        break;
-      case AppVoiceState.idle:
-      case AppVoiceState.error:
-      case AppVoiceState.interrupted:
         startListening();
         break;
-      case AppVoiceState.transcribing:
+      case AppState.thinking:
+        // Already processing — ignore.
+        break;
+      case AppState.idle:
+      case AppState.error:
+        startListening();
         break;
     }
   }
@@ -545,21 +387,10 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
     return id;
   }
 
-  Language _mapAzureLanguage(String azureCode) {
-    final code = azureCode.toLowerCase();
-    if (code.contains('hi')) return Language.hindi;
-    if (code.contains('mr')) return Language.marathi;
-    if (code.contains('te')) return Language.telugu;
-    return Language.english;
-  }
-
   @override
   void dispose() {
-    _audioStreamSub?.cancel();
-    _streamingClient?.stopStream();
     _cameraService.dispose();
     _recorder.dispose();
-    _ttsService.stop();
     super.dispose();
   }
 }
