@@ -295,8 +295,14 @@ class AzureAIService:
                             yield content.replace("\n", " ")
                     except json.JSONDecodeError:
                         pass
+        except (httpx.RemoteProtocolError, httpx.ReadError):
+            # Expected: server closes the TCP connection right after sending [DONE].
+            # httpx raises this when it tries to drain the socket for pool reuse
+            # and finds it already closed. The stream completed successfully.
+            pass
         except Exception as e:
-            _log(f"[StreamText] Error: {e}")
+            if str(e).strip():
+                _log(f"[StreamText] Error: {e}")
 
     def _parse_response(self, content: str, language_name: str) -> dict:
         """Parse JSON string from the LLM into the expected dict format."""

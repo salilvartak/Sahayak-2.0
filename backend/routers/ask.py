@@ -6,6 +6,7 @@ from services.agent import agent_graph
 from services.blob_service import blob_service
 from services.cosmos_client import cosmos_client
 from services.azure_ai_service import azure_ai_service
+from services.open_food_facts_service import open_food_facts_service
 from models.schemas import AskResponse
 
 router = APIRouter()
@@ -22,6 +23,7 @@ async def ask(
     was_interruption: bool = Form(False),
     partial_response: str = Form(""),
     previous_intent: str = Form(""),
+    barcode: str = Form(""),
 ):
     interaction_id = str(uuid.uuid4())
     image_bytes = None
@@ -48,12 +50,22 @@ async def ask(
         # 0. Get the previous interaction ID for this session to maintain history chain
         prev_interaction_id = await cosmos_client.get_last_interaction_id(device_id, session_id)
         
+        product_data = await open_food_facts_service.fetch_product(barcode)
+        product_context = open_food_facts_service.build_prompt_context(barcode, product_data) if barcode else ""
+        enriched_query = query
+        if product_context:
+            enriched_query = (
+                f"{query}\n\n"
+                "You also have trusted barcode product details below. Use them if relevant to the user question.\n"
+                f"{product_context}"
+            )
+
         # Prepare state for LangGraph pipeline
         state = {
             "user_id": device_id,
             "session_id": session_id,
             "interaction_id": interaction_id,
-            "query": query,
+            "query": enriched_query,
             "language": language,
             "image_bytes": image_bytes,
             "blob_name": blob_name,
@@ -62,6 +74,9 @@ async def ask(
             "was_interruption": was_interruption,
             "partial_response": partial_response,
             "previous_intent": previous_intent,
+            "barcode": barcode or None,
+            "product_context": product_context or None,
+            "user_query": query,
         }
         print(f"[ask] query='{query}' | language='{language}' | image={'yes' if image_bytes else 'no'} ({len(image_bytes) if image_bytes else 0} bytes)", flush=True)
 
@@ -93,6 +108,7 @@ async def ask_stream(
     was_interruption: bool = Form(False),
     partial_response: str = Form(""),
     previous_intent: str = Form(""),
+    barcode: str = Form(""),
 ):
     """SSE streaming endpoint — yields plain-text tokens as they arrive from the
     LLM so the Flutter client can pipe each sentence to TTS immediately, giving
@@ -115,11 +131,21 @@ async def ask_stream(
 
     prev_interaction_id = await cosmos_client.get_last_interaction_id(device_id, session_id)
 
+    product_data = await open_food_facts_service.fetch_product(barcode)
+    product_context = open_food_facts_service.build_prompt_context(barcode, product_data) if barcode else ""
+    enriched_query = query
+    if product_context:
+        enriched_query = (
+            f"{query}\n\n"
+            "You also have trusted barcode product details below. Use them if relevant to the user question.\n"
+            f"{product_context}"
+        )
+
     state = {
         "user_id": device_id,
         "session_id": session_id,
         "interaction_id": interaction_id,
-        "query": query,
+        "query": enriched_query,
         "language": language,
         "image_bytes": image_bytes,
         "blob_name": blob_name,
@@ -130,6 +156,9 @@ async def ask_stream(
         "previous_intent": previous_intent,
         "response_text": "",
         "extracted_memory": {},
+        "barcode": barcode or None,
+        "product_context": product_context or None,
+        "user_query": query,
     }
     print(f"[ask/stream] query='{query}' | language='{language}' | image={'yes' if image_bytes else 'no'}", flush=True)
 

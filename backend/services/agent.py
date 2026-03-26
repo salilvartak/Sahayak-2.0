@@ -25,6 +25,9 @@ class AgentState(TypedDict):
     was_interruption: Optional[bool]
     partial_response: Optional[str]
     previous_intent: Optional[str]
+    barcode: Optional[str]
+    product_context: Optional[str]
+    user_query: Optional[str]
 
 # --- Python-based routing (no LLM round-trip) ---
 
@@ -178,7 +181,7 @@ async def history_write_node(state: AgentState):
             "user_id": state["user_id"],
             "session_id": state["session_id"],
             "interaction_id": state["interaction_id"],
-            "user_message": state["query"],
+            "user_message": state.get("user_query") or state["query"],
             "ai_response": state["response_text"],
             "language": language_code,
             "blob_name": state.get("blob_name"),
@@ -192,7 +195,7 @@ async def history_write_node(state: AgentState):
             user_id=state["user_id"],
             session_id=state["session_id"],
             interaction_id=state["interaction_id"],
-            user_message=state["query"],
+            user_message=state.get("user_query") or state["query"],
             ai_response_text=state["response_text"],
             extracted_memory=state.get("extracted_memory", {}),
             prev_interaction_id=state.get("prev_interaction_id")

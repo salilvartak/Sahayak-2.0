@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/conversation_provider.dart';
@@ -18,7 +19,7 @@ class MainScreen extends ConsumerStatefulWidget {
 }
 
 class _MainScreenState extends ConsumerState<MainScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   
   // Tutorial Keys
   final GlobalKey _micKey = GlobalKey();
@@ -29,16 +30,27 @@ class _MainScreenState extends ConsumerState<MainScreen>
   final TextEditingController _textController = TextEditingController();
   bool _isSilentMode = false;
 
-  TutorialCoachMark? _tutorialCoachMark;
-
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(conversationProvider.notifier).initialize();
       _checkAndShowTutorial();
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final notifier = ref.read(conversationProvider.notifier);
+    if (state == AppLifecycleState.resumed) {
+      notifier.handleAppResumed();
+    } else if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      notifier.handleAppPausedOrInactive();
+    }
   }
 
   void _checkAndShowTutorial() {
@@ -53,20 +65,36 @@ class _MainScreenState extends ConsumerState<MainScreen>
     final localizations = AppLocalizations(language);
     final tts = ref.read(ttsServiceProvider);
     final settings = ref.read(settingsProvider);
-    tts.setSpeed(settings.voiceSpeed);
+    tts.setSpeed('Slow');
 
     final List<String> stepIds = ['welcome', 'mic', 'camera', 'flash', 'orb', 'history'];
+    final Map<String, List<String>> tutorialKeysMap = {
+      'welcome': ['tutorial_welcome_title', 'tutorial_welcome_desc'],
+      'mic': ['tutorial_mic_title', 'tutorial_mic_desc'],
+      'camera': ['tutorial_camera_title', 'tutorial_camera_desc'],
+      'flash': ['tutorial_flash_title', 'tutorial_flash_desc'],
+      'orb': ['tutorial_orb_title', 'tutorial_orb_desc'],
+      'history': ['tutorial_history_title', 'tutorial_history_desc'],
+    };
 
-    void speakTutorial(String titleKey, String descKey, String identify) {
+    Future<void> speakTutorial(String titleKey, String descKey, String identify) async {
       final title = localizations.translate(titleKey);
       final desc = localizations.translate(descKey);
       final isLast = identify == stepIds.last;
-      
-      final swipeInstruction = localizations.translate(
-        isLast ? 'tutorial_swipe_finish' : 'tutorial_swipe_next'
-      );
-      
-      tts.speak("$title. $desc. $swipeInstruction", language);
+      final gestureHint = isLast
+          ? "Single tap this avatar to hear this step again. Double tap this avatar to finish the tutorial."
+          : "Single tap this avatar to repeat this instruction. Double tap this avatar to go to the next step.";
+
+      final detailedMessage =
+          "$title. $desc. $gestureHint This guide is detailed. Take your time and follow each step.";
+      await tts.speak(detailedMessage, language);
+    }
+
+    void repeatCurrentStep(String identify) {
+      final keys = tutorialKeysMap[identify];
+      if (keys != null) {
+        unawaited(speakTutorial(keys[0], keys[1], identify));
+      }
     }
 
     List<TargetFocus> targets = [
@@ -79,7 +107,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
             align: ContentAlign.bottom,
             builder: (context, controller) => _buildTutorialStepContent(
               controller,
-              localizations,
+              identify: "welcome",
+              onRepeat: () => repeatCurrentStep("welcome"),
               isLast: false,
             ),
           ),
@@ -93,7 +122,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
             align: ContentAlign.top,
             builder: (context, controller) => _buildTutorialStepContent(
               controller,
-              localizations,
+              identify: "mic",
+              onRepeat: () => repeatCurrentStep("mic"),
               isLast: false,
             ),
           ),
@@ -107,7 +137,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
             align: ContentAlign.top,
             builder: (context, controller) => _buildTutorialStepContent(
               controller,
-              localizations,
+              identify: "camera",
+              onRepeat: () => repeatCurrentStep("camera"),
               isLast: false,
             ),
           ),
@@ -121,7 +152,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
             align: ContentAlign.top,
             builder: (context, controller) => _buildTutorialStepContent(
               controller,
-              localizations,
+              identify: "flash",
+              onRepeat: () => repeatCurrentStep("flash"),
               isLast: false,
             ),
           ),
@@ -135,7 +167,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
             align: ContentAlign.top,
             builder: (context, controller) => _buildTutorialStepContent(
               controller,
-              localizations,
+              identify: "orb",
+              onRepeat: () => repeatCurrentStep("orb"),
               isLast: false,
             ),
           ),
@@ -149,102 +182,97 @@ class _MainScreenState extends ConsumerState<MainScreen>
             align: ContentAlign.bottom,
             builder: (context, controller) => _buildTutorialStepContent(
               controller,
-              localizations,
-              isLast: false,
+              identify: "history",
+              onRepeat: () => repeatCurrentStep("history"),
+              isLast: true,
             ),
           ),
         ],
       ),
     ];
 
-    _tutorialCoachMark = TutorialCoachMark(
+    final tutorialCoachMark = TutorialCoachMark(
       targets: targets,
       beforeFocus: (target) {
-        final Map<String, List<String>> tutorialKeysMap = {
-          'welcome': ['tutorial_welcome_title', 'tutorial_welcome_desc'],
-          'mic': ['tutorial_mic_title', 'tutorial_mic_desc'],
-          'camera': ['tutorial_camera_title', 'tutorial_camera_desc'],
-          'flash': ['tutorial_flash_title', 'tutorial_flash_desc'],
-          'orb': ['tutorial_orb_title', 'tutorial_orb_desc'],
-          'history': ['tutorial_history_title', 'tutorial_history_desc'],
-        };
         final keys = tutorialKeysMap[target.identify];
         if (keys != null) {
-          speakTutorial(keys[0], keys[1], target.identify);
+          unawaited(speakTutorial(keys[0], keys[1], target.identify));
         }
       },
       colorShadow: Colors.black.withOpacity(0.95),
       opacityShadow: 0.95,
       paddingFocus: 10,
       hideSkip: true,
-      onClickOverlay: (target) {
-        _tutorialCoachMark?.next();
-      },
+      onClickOverlay: (target) {},
       onFinish: () {
         tts.stop();
+        tts.setSpeed(settings.voiceSpeed);
         ref.read(settingsProvider.notifier).setTutorialCompleted(true);
       },
       onSkip: () {
         tts.stop();
+        tts.setSpeed(settings.voiceSpeed);
         ref.read(settingsProvider.notifier).setTutorialCompleted(true);
         return true;
       },
-    )..show(context: context);
+    );
+    tutorialCoachMark.show(context: context);
   }
 
   Widget _buildTutorialStepContent(
     TutorialCoachMarkController controller,
-    AppLocalizations localizations, {
+    {
+    required String identify,
+    required VoidCallback onRepeat,
     bool isLast = false,
   }) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onHorizontalDragEnd: (details) {
-        // Use horizontal drag for "next" to avoid Oplus "Scroll to Top" conflict
-        if (details.velocity.pixelsPerSecond.dx.abs() > 150) {
-          if (isLast) {
-            ref.read(settingsProvider.notifier).setTutorialCompleted(true);
-            controller.skip();
-          } else {
-            controller.next();
-          }
-        }
-      },
-      child: Container(
-        width: MediaQuery.of(context).size.width,
-        height: 300, // Make it big for easier swiping
-        color: Colors.transparent,
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            // Prominent Logo instead of text
-            _TutorialBotIcon(),
-            const SizedBox(height: 30),
-            // Subtle animated swipe indicator
-            TweenAnimationBuilder<double>(
-              tween: Tween(begin: 0.0, end: 1.0),
-              duration: const Duration(seconds: 2),
-              curve: Curves.easeInOut,
-              onEnd: () {},
-              builder: (context, value, child) {
-                return Opacity(
-                  opacity: 0.3 + (math.sin(value * math.pi).abs() * 0.4),
-                  child: const Icon(
-                    Icons.swipe_outlined, 
-                    color: Colors.white, 
-                    size: 32
-                  ),
-                );
-              },
+    return SizedBox(
+      width: MediaQuery.of(context).size.width,
+      height: 300,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          _TutorialSpeakingAvatar(
+            onSingleTap: onRepeat,
+            onDoubleTap: () {
+              if (isLast) {
+                ref.read(settingsProvider.notifier).setTutorialCompleted(true);
+                controller.skip();
+              } else {
+                controller.next();
+              }
+            },
+          ),
+          const SizedBox(height: 22),
+          Text(
+            isLast
+                ? 'Tap avatar: repeat  |  Double tap: finish'
+                : 'Tap avatar: repeat  |  Double tap: next',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.78),
+              fontSize: 13,
+              letterSpacing: 0.3,
+              fontWeight: FontWeight.w400,
             ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            identify.toUpperCase(),
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.5),
+              fontSize: 11,
+              letterSpacing: 1.8,
+            ),
+          ),
+        ],
       ),
     );
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _textController.dispose();
     super.dispose();
   }
@@ -319,7 +347,22 @@ class _MainScreenState extends ConsumerState<MainScreen>
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    if (_isSilentMode) _buildSilentInputArea(),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 280),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) => FadeTransition(
+                        opacity: animation,
+                        child: SizeTransition(
+                          sizeFactor: animation,
+                          axisAlignment: -1,
+                          child: child,
+                        ),
+                      ),
+                      child: _isSilentMode
+                          ? _buildSilentInputArea()
+                          : const SizedBox.shrink(),
+                    ),
                     ControlBarWidget(
                       micKey: _micKey,
                       cameraKey: _cameraKey,
@@ -338,6 +381,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
   Widget _buildSilentInputArea() {
     const language = Language.english;
     return Container(
+      key: const ValueKey('silent_input'),
       margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       decoration: BoxDecoration(
@@ -505,15 +549,104 @@ class _SahayakLogo extends StatelessWidget {
   }
 }
 
+class _TutorialSpeakingAvatar extends StatefulWidget {
+  final VoidCallback onSingleTap;
+  final VoidCallback onDoubleTap;
+
+  const _TutorialSpeakingAvatar({
+    required this.onSingleTap,
+    required this.onDoubleTap,
+  });
+
+  @override
+  State<_TutorialSpeakingAvatar> createState() => _TutorialSpeakingAvatarState();
+}
+
+class _TutorialSpeakingAvatarState extends State<_TutorialSpeakingAvatar>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _ringController;
+
+  @override
+  void initState() {
+    super.initState();
+    _ringController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1700),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _ringController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: widget.onSingleTap,
+      onDoubleTap: widget.onDoubleTap,
+      child: AnimatedBuilder(
+        animation: _ringController,
+        builder: (context, child) {
+          final t = _ringController.value;
+          final pulse = 0.94 + (math.sin(t * 2 * math.pi).abs() * 0.14);
+          return SizedBox(
+            width: 160,
+            height: 160,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                _TutorialRing(scale: 1.05 + (t * 0.22), opacity: 0.26 * (1 - t)),
+                _TutorialRing(scale: 1.18 + (t * 0.24), opacity: 0.16 * (1 - t)),
+                Transform.scale(
+                  scale: pulse,
+                  child: const _TutorialBotIcon(),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _TutorialRing extends StatelessWidget {
+  final double scale;
+  final double opacity;
+
+  const _TutorialRing({required this.scale, required this.opacity});
+
+  @override
+  Widget build(BuildContext context) {
+    return Transform.scale(
+      scale: scale,
+      child: Container(
+        width: 108,
+        height: 108,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: const Color(0xFF6C8EFF).withOpacity(opacity),
+            width: 2.2,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _TutorialBotIcon extends StatelessWidget {
+  const _TutorialBotIcon();
+
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 120,
-      height: 120,
+      width: 112,
+      height: 112,
       decoration: const BoxDecoration(
         shape: BoxShape.circle,
-        // Using a simpler shadow to reduce overdraw
         boxShadow: [
           BoxShadow(
             color: Colors.black26,
@@ -543,7 +676,6 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
   late AnimationController _pulseController;
   late AnimationController _rotateController;
   late AnimationController _waveController;
-  late Animation<double> _pulseAnim;
 
   @override
   void initState() {
@@ -563,9 +695,6 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
       duration: const Duration(milliseconds: 900),
     )..repeat(reverse: true);
 
-    _pulseAnim = Tween<double>(begin: 0.92, end: 1.08).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-    );
   }
 
   @override

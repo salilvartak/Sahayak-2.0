@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:record/record.dart';
@@ -11,6 +12,7 @@ import '../services/camera_service.dart';
 import '../services/tts_service.dart';
 import '../services/backend_service.dart';
 import '../services/azure_speech_service.dart';
+import '../services/barcode_service.dart';
 import '../utils/image_utils.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'settings_provider.dart';
@@ -58,6 +60,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
   final AzureSpeechService _azureSpeechService = AzureSpeechService();
   final TTSService _ttsService = TTSService();
   final BackendService _backendService = BackendService();
+  final BarcodeService _barcodeService = BarcodeService();
 
   String? _recordingPath;
   Language _detectedLanguage = Language.english;
@@ -166,8 +169,10 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       // Parallel: capture+compress image AND transcribe audio
       final captureTask = _captureAndCompress();
       final sttTask = _azureSpeechService.recognize(path);
-      final compressedFile = await captureTask;
+      final captureResult = await captureTask;
       final sttResult = await sttTask;
+      final compressedFile = captureResult.file;
+      final barcode = captureResult.barcode;
 
       final transcript =
           sttResult.transcript.isNotEmpty ? sttResult.transcript : 'What is this?';
@@ -207,6 +212,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
         deviceId: deviceId,
         query: transcript,
         imageFile: compressedFile,
+        barcode: barcode,
         language: _detectedLanguage,
         sessionId: _currentSessionId,
       )) {
@@ -271,17 +277,19 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
     }
   }
 
-  /// Capture a camera frame and compress it in a background isolate.
+  /// Capture a camera frame, detect barcode, and compress image in background.
   /// Returns null if the camera is unavailable (non-fatal — backend handles
   /// null image gracefully).
-  Future<File?> _captureAndCompress() async {
+  Future<_CaptureResult> _captureAndCompress() async {
     try {
       final xFile = await _cameraService.captureFrame();
-      if (xFile == null) return null;
-      return await ImageUtils.compressImage(xFile.path);
+      if (xFile == null) return const _CaptureResult(file: null, barcode: null);
+      final barcode = await _barcodeService.scanImagePath(xFile.path);
+      final compressed = await ImageUtils.compressImage(xFile.path);
+      return _CaptureResult(file: compressed, barcode: barcode);
     } catch (e) {
       debugPrint('[Capture] Failed (non-fatal): $e');
-      return null;
+      return const _CaptureResult(file: null, barcode: null);
     }
   }
 
@@ -292,6 +300,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       final xFile = await _cameraService.captureFrame();
       if (xFile == null) throw Exception('Camera capture failed');
 
+      final barcode = await _barcodeService.scanImagePath(xFile.path);
       final compressedFile = await ImageUtils.compressImage(xFile.path);
       final deviceId = await _getDeviceId();
 
@@ -299,6 +308,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
         deviceId: deviceId,
         query: query,
         imageFile: File(compressedFile.path),
+        barcode: barcode,
         language: language,
         sessionId: _currentSessionId,
       );
@@ -371,6 +381,20 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
     state = state.copyWith();
   }
 
+  Future<void> handleAppResumed() async {
+    try {
+      await _cameraService.onAppResumed();
+      state = state.copyWith();
+    } catch (e) {
+      debugPrint('[Lifecycle] Camera resume failed: $e');
+    }
+  }
+
+  Future<void> handleAppPausedOrInactive() async {
+    await _cameraService.onAppInactiveOrPaused();
+    state = state.copyWith();
+  }
+
   Future<void> toggleFlash() async {
     await _cameraService.toggleFlash();
     state = state.copyWith(isFlashOn: _cameraService.isFlashOn);
@@ -389,8 +413,15 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
 
   @override
   void dispose() {
-    _cameraService.dispose();
+    unawaited(_cameraService.dispose());
+    unawaited(_barcodeService.dispose());
     _recorder.dispose();
     super.dispose();
   }
+}
+
+class _CaptureResult {
+  final File? file;
+  final String? barcode;
+  const _CaptureResult({required this.file, required this.barcode});
 }

@@ -34,6 +34,7 @@ class BackendService {
     bool wasInterruption = false,
     String partialResponse = '',
     String previousIntent = '',
+    String? barcode,
   }) async {
     for (int attempt = 0; attempt < _maxRetries; attempt++) {
       if (attempt > 0) {
@@ -54,6 +55,9 @@ class BackendService {
         request.fields['was_interruption'] = wasInterruption.toString();
         request.fields['partial_response'] = partialResponse;
         request.fields['previous_intent'] = previousIntent;
+        if (barcode != null && barcode.isNotEmpty) {
+          request.fields['barcode'] = barcode;
+        }
 
         debugPrint('[Backend] Attempt ${attempt + 1}/$_maxRetries '
             'query="${query.substring(0, query.length.clamp(0, 60))}" '
@@ -118,6 +122,7 @@ class BackendService {
     bool wasInterruption = false,
     String partialResponse = '',
     String previousIntent = '',
+    String? barcode,
   }) async* {
     final uri = Uri.parse('$_baseUrl/ask/stream');
     final request = http.MultipartRequest('POST', uri);
@@ -129,6 +134,9 @@ class BackendService {
     request.fields['was_interruption'] = wasInterruption.toString();
     request.fields['partial_response'] = partialResponse;
     request.fields['previous_intent'] = previousIntent;
+    if (barcode != null && barcode.isNotEmpty) {
+      request.fields['barcode'] = barcode;
+    }
 
     if (imageFile != null) {
       request.files.add(

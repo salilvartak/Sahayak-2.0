@@ -91,26 +91,40 @@ class _GlassControl extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 54,
-        height: 54,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: isActive
-              ? Colors.white.withOpacity(0.2)
-              : Colors.white.withOpacity(0.08),
-          border: Border.all(
-            color: isActive
-                ? Colors.white.withOpacity(0.4)
-                : Colors.white.withOpacity(0.12),
+    return AnimatedScale(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      scale: isActive ? 1.06 : 1,
+      child: Material(
+        color: Colors.transparent,
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onTap,
+          splashColor: Colors.white24,
+          highlightColor: Colors.white10,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 280),
+            curve: Curves.easeOutCubic,
+            width: 54,
+            height: 54,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: isActive
+                  ? Colors.white.withOpacity(0.2)
+                  : Colors.white.withOpacity(0.08),
+              border: Border.all(
+                color: isActive
+                    ? Colors.white.withOpacity(0.4)
+                    : Colors.white.withOpacity(0.12),
+              ),
+            ),
+            child: Icon(
+              icon,
+              color: isActive ? Colors.white : Colors.white70,
+              size: 22,
+            ),
           ),
-        ),
-        child: Icon(
-          icon,
-          color: isActive ? Colors.white : Colors.white70,
-          size: 22,
         ),
       ),
     );
