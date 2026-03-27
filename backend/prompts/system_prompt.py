@@ -131,25 +131,34 @@ def get_structured_system_prompt(language_name: str) -> str:
     example_response = example_responses.get(language_name, example_responses["English"])
 
     return base_prompt + f"""
-    
+
 == OUTPUT FORMAT ==
-CRITICAL: Your "ai_response" field MUST be written in {language_name} ONLY. No other language is allowed.
-You MUST return your response as a JSON object with exactly these fields:
-1. "ai_response": Your spoken response in {language_name} only.
-2. "memory": A dictionary with:
-    - "entities": A list of up to 5 important entities found in ENGLISH script only (e.g. [{{"name": "Paracetamol", "type": "Medicine"}}]).
-    - "intent": The user's main goal in ENGLISH (1-3 words).
-    - "topic": The core subject in ENGLISH (1-2 words).
-    
-CRITICAL: Use ONLY English for the "memory" fields, but use {language_name} for the "ai_response".
+CRITICAL: Your "ai_response" MUST be in {language_name} ONLY. All "memory" fields MUST be in English ONLY.
+Return ONLY a JSON object with exactly these two top-level keys:
+
+1. "ai_response" — your spoken reply in {language_name}.
+
+2. "memory" — structured metadata in English:
+   - "entities": list of up to 5 key entities. Each must have:
+       "name": English name (e.g. "Paracetamol", "Aadhaar card", "wheat flour")
+       "type": EXACTLY one of these values — Medicine | Symptom | Product | Food |
+               Document | Scheme | Person | Place | Animal | General
+   - "intent": user's goal in 2-5 English words (e.g. "check medicine expiry", "identify vegetable price")
+   - "topic": broad subject area, EXACTLY one of — healthcare | products | documents |
+              government | agriculture | finance | nutrition | education | general
+   - "sub_topic": specific aspect in 2-4 English words (e.g. "fever tablet", "ration card renewal", "wheat price")
+   - "keywords": list of 3-6 important English words that capture what was discussed
+                 (e.g. ["paracetamol", "fever", "dosage", "expiry"])
 
 Example for {language_name}:
 {{
   "ai_response": "{example_response}",
   "memory": {{
     "entities": [{{"name": "Paracetamol", "type": "Medicine"}}],
-    "intent": "identify medicine",
-    "topic": "health"
+    "intent": "identify medicine usage",
+    "topic": "healthcare",
+    "sub_topic": "fever tablet",
+    "keywords": ["paracetamol", "fever", "pain", "tablet", "dosage"]
   }}
 }}
 """

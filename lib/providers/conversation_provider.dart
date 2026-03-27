@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:async';
+import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:record/record.dart';
@@ -95,7 +96,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
 
       if (!cameraStatus.isGranted || !micStatus.isGranted) {
         state = state.copyWith(status: AppState.error);
-        const language = Language.english;
+        final language = _deviceLanguage();
         final localizations = AppLocalizations(language);
         await _ttsService.speak(
             localizations.translate('permission_error'), language);
@@ -108,7 +109,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       } catch (e) {
         debugPrint('[Init] Camera initialization failed: $e');
         state = state.copyWith(status: AppState.error);
-        const language = Language.english;
+        final language = _deviceLanguage();
         final localizations = AppLocalizations(language);
         await _ttsService.speak(
             localizations.translate('camera_error'), language);
@@ -117,7 +118,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
 
       final settings = _ref.read(settingsProvider);
       if (settings.tutorialCompleted) {
-        const language = Language.english;
+        final language = _deviceLanguage();
         final localizations = AppLocalizations(language);
         await _ttsService.speak(
             localizations.translate('welcome_message'), language);
@@ -257,7 +258,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       debugPrint('$stackTrace');
       _ttsService.onAllCompleted = null;
       state = state.copyWith(status: AppState.error);
-      const language = Language.english;
+      final language = _deviceLanguage();
       final localizations = AppLocalizations(language);
 
       String errorKey = 'connection_error';
@@ -409,6 +410,15 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       await prefs.setString('device_id', id);
     }
     return id;
+  }
+
+  Language _deviceLanguage() {
+    final locale = ui.PlatformDispatcher.instance.locale;
+    final langCode = locale.languageCode.toLowerCase();
+    for (final language in Language.values) {
+      if (language.code == langCode) return language;
+    }
+    return Language.english;
   }
 
   @override

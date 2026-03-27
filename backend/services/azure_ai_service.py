@@ -226,6 +226,107 @@ class AzureAIService:
         _log(f"[Workhorse] All attempts failed: {last_error}")
         return await self._fallback_to_gemini(prompt, image_bytes, language_name, custom_system_prompt)
 
+    async def extract_memory(
+        self,
+        query: str,
+        response_text: str,
+        language_name: str = "English",
+    ) -> dict:
+        """
+        Lightweight gpt-4o-mini call that extracts structured memory from a
+        completed conversation turn.  Called as a background task after the
+        streaming response finishes — does NOT block the user.
+
+        Returns the same memory dict shape as get_response_with_custom_prompt:
+        { "entities": [...], "intent": "...", "topic": "...",
+          "sub_topic": "...", "keywords": [...] }
+        """
+        # Truncate to keep the prompt small and cheap
+        q = (query or "")[:300]
+        r = (response_text or "")[:600]
+
+        extraction_prompt = f"""Extract structured memory from this conversation. Return ONLY valid JSON, nothing else.
+
+User said: "{q}"
+AI replied: "{r}"
+
+JSON format required:
+{{
+  "entities": [{{"name": "English name", "type": "Medicine|Symptom|Product|Food|Document|Scheme|Person|Place|Animal|General"}}],
+  "intent": "2-5 word user goal in English",
+  "topic": "one of: healthcare|products|documents|government|agriculture|finance|nutrition|education|general",
+  "sub_topic": "2-4 word specific aspect in English",
+  "keywords": ["keyword1", "keyword2", "keyword3"]
+}}"""
+
+        payload = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "Output ONLY a raw JSON object. No markdown, no wrapper keys, no extra text. Start your response with { and end with }."},
+                {"role": "user",   "content": extraction_prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens":  500,
+            # No response_format — it makes the model wrap JSON in {"final": "...escaped string..."}
+        }
+        headers = {"api-key": self.api_key, "Content-Type": "application/json"}
+        try:
+            resp = await self._http.post(
+                self.endpoint, headers=headers, json=payload, timeout=15.0
+            )
+            if resp.status_code != 200:
+                body = resp.text[:200]
+                _log(f"[MemExtract] HTTP {resp.status_code}: {body}")
+                return {}
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                _log("[MemExtract] Empty choices in response")
+                return {}
+            content = choices[0].get("message", {}).get("content", "")
+            # Strip markdown fences
+            raw = content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+
+            # Try direct parse first, then fall back to regex extraction
+            memory = None
+            try:
+                memory = json.loads(raw)
+            except json.JSONDecodeError:
+                m = re.search(r"\{.*\}", raw, re.DOTALL)
+                if not m:
+                    _log(f"[MemExtract] No JSON found in: {raw[:120]}")
+                    return {}
+                memory = json.loads(m.group())
+
+            # Unwrap if LLM nested result under a wrapper key ("final", "memory", "result", etc.)
+            # Also handles when the wrapper value is itself an escaped JSON string
+            depth = 0
+            while "topic" not in memory and len(memory) == 1 and depth < 4:
+                inner = next(iter(memory.values()))
+                if isinstance(inner, dict):
+                    memory = inner
+                elif isinstance(inner, str):
+                    try:
+                        parsed = json.loads(inner)
+                        if isinstance(parsed, dict):
+                            memory = parsed
+                        else:
+                            break
+                    except json.JSONDecodeError:
+                        break
+                else:
+                    break
+                depth += 1
+
+            _log(f"[MemExtract] OK — topic={memory.get('topic')} "
+                 f"sub={memory.get('sub_topic')} kw={memory.get('keywords')}")
+            return memory
+        except Exception as e:
+            _log(f"[MemExtract] Error: {e}")
+            return {}
+
     async def stream_text(
         self,
         prompt: str,
@@ -326,7 +427,7 @@ class AzureAIService:
             # If it's not JSON, assume the whole content is the response
             return {
                 "ai_response": content.strip(),
-                "memory": {"entities": [], "intent": "conversational", "topic": "general"}
+                "memory": {"entities": [], "intent": "general interaction", "topic": "general"}
             }
 
     async def raw_call(self, system_message: str, user_message: str) -> str:

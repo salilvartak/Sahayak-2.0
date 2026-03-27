@@ -180,6 +180,12 @@ async def ask_stream(
             yield f"data: {token}\n\n"
 
         # Stream complete — persist to Cosmos + Neo4j in background
+        if not state.get("extracted_memory"):
+            state["extracted_memory"] = {
+                "entities": [],
+                "intent": "general interaction",
+                "topic": "general",
+            }
         state["response_text"] = "".join(full_response)
         asyncio.create_task(history_write_node(state))
         yield "data: [DONE]\n\n"

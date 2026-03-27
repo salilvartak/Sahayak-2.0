@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/conversation_provider.dart';
 
@@ -30,7 +31,10 @@ class ControlBarWidget extends ConsumerWidget {
           _GlassControl(
             key: cameraKey,
             icon: Icons.flip_camera_ios_rounded,
-            onTap: () => ref.read(conversationProvider.notifier).switchCamera(),
+            onTap: () {
+              HapticFeedback.lightImpact();
+              ref.read(conversationProvider.notifier).switchCamera();
+            },
           ),
 
           // --- PTT Mic Button ---
@@ -40,6 +44,7 @@ class ControlBarWidget extends ConsumerWidget {
             onLongPressStart: () {
               final s = ref.read(conversationProvider).status;
               if (s == AppState.thinking) return;
+              HapticFeedback.heavyImpact();
               if (s == AppState.speaking) {
                 ref.read(conversationProvider.notifier).stopSpeaking();
               }
@@ -48,6 +53,7 @@ class ControlBarWidget extends ConsumerWidget {
             onLongPressEnd: () {
               final s = ref.read(conversationProvider).status;
               if (s == AppState.listening) {
+                HapticFeedback.mediumImpact();
                 ref.read(conversationProvider.notifier).stopListeningAndProcess();
               }
             },
@@ -55,6 +61,7 @@ class ControlBarWidget extends ConsumerWidget {
               final s = ref.read(conversationProvider).status;
               if (s == AppState.thinking) return;
               if (s == AppState.speaking) {
+                HapticFeedback.mediumImpact();
                 ref.read(conversationProvider.notifier).stopSpeaking();
               }
             },
@@ -65,7 +72,10 @@ class ControlBarWidget extends ConsumerWidget {
             key: flashKey,
             icon: isFlashOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
             isActive: isFlashOn,
-            onTap: () => ref.read(conversationProvider.notifier).toggleFlash(),
+            onTap: () {
+              HapticFeedback.lightImpact();
+              ref.read(conversationProvider.notifier).toggleFlash();
+            },
           ),
         ],
       ),

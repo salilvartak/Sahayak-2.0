@@ -42,18 +42,22 @@ def _route_request(state: AgentState, routing_context: dict, streaming: bool = F
     has_image = state.get("image_bytes") is not None
     language = state.get("language", "en")
     is_non_english = not language.startswith("en")
-    query_words = len((state.get("query") or "").split())
+    # Use original user question for complexity — state["query"] is the enriched version
+    # which includes product context and memory and is always long
+    raw_query = state.get("user_query") or state.get("query") or ""
+    query_words = len(raw_query.split())
 
     # Weighted routing score
     score = 0
     score += 20 if depth >= 5 else (12 if depth >= 3 else 5)
     score += int(continuity * 20)
     score += 20 if query_words > 15 else 5
-    score += 15 if has_image else 0
+    score += 20 if has_image else 0
     score += 10 if is_non_english else 0
 
-    # Model selection: always gpt-4o when image present or high complexity
-    model = "gpt-4o" if (has_image or score >= 40) else "gpt-4o-mini"
+    # Threshold 50: simple Hindi+image queries score ~40 → mini;
+    # long/deep/continuing conversations score 50+ → gpt-4o
+    model = "gpt-4o" if score >= 50 else "gpt-4o-mini"
 
     # Build enriched system prompt = base + optional memory context block
     lang_cap = language.capitalize() if language else "English"
@@ -66,12 +70,33 @@ def _route_request(state: AgentState, routing_context: dict, streaming: bool = F
     entities = routing_context.get("entities_mentioned", [])
     prev_id = state.get("prev_interaction_id")
 
-    if topics or entities or (prev_id and depth > 1):
+    dominant_category = routing_context.get("dominant_category")
+    sub_topics        = routing_context.get("recent_sub_topics", [])
+    recent_intents    = routing_context.get("recent_intents", [])
+    entity_types      = routing_context.get("entity_types", [])
+
+    has_context = topics or entities or dominant_category or (prev_id and depth > 1)
+    if has_context:
         memory_block = "\n\n## User Memory Context\n"
+
+        if dominant_category:
+            memory_block += f"- User's domain: {dominant_category}\n"
+
         if topics:
-            memory_block += f"- Past topics: {', '.join(str(t) for t in topics[:3])}\n"
+            topic_str = ", ".join(str(t) for t in topics[:3])
+            if sub_topics:
+                topic_str += f" (specifically: {', '.join(str(s) for s in sub_topics[:3])})"
+            memory_block += f"- Topics of interest: {topic_str}\n"
+
+        if recent_intents:
+            memory_block += f"- Recent goals: {', '.join(str(i) for i in recent_intents[:3])}\n"
+
+        if entity_types:
+            memory_block += f"- Entity types discussed: {', '.join(entity_types[:3])}\n"
+
         if entities:
             memory_block += f"- Known entities: {', '.join(str(e) for e in entities[:5])}\n"
+
         if prev_id and depth > 1:
             memory_block += (
                 f"- Continuing conversation ({depth} turns, "
@@ -162,9 +187,27 @@ _LANGUAGE_BCP47 = {
     'urdu':      'ur-IN',
 }
 
+def _memory_is_empty(memory: dict | None) -> bool:
+    """True when memory carries no useful signal (streaming default or missing)."""
+    if not memory:
+        return True
+    topic = (memory.get("topic") or "").strip().lower()
+    intent = (memory.get("intent") or "").strip().lower()
+    has_entities = bool(memory.get("entities"))
+    has_keywords = bool(memory.get("keywords"))
+    return (
+        not has_entities
+        and not has_keywords
+        and topic in ("", "general")
+        and intent in ("", "general interaction", "general", "conversational")
+    )
+
+
 async def history_write_node(state: AgentState):
     """
-    Saves the interaction to Cosmos DB and updates the Knowledge Graph using already-extracted memory.
+    Saves the interaction to Cosmos DB and updates the Knowledge Graph.
+    For streaming responses (extracted_memory is empty), runs a fast background
+    gpt-4o-mini call to extract memory from the completed response text.
     """
     try:
         print(f"DEBUG: Processing history for interaction {state.get('interaction_id')}. Blob: {state.get('blob_name')}")
@@ -176,29 +219,43 @@ async def history_write_node(state: AgentState):
             else _LANGUAGE_BCP47.get(raw_lang.lower(), 'hi-IN')
         )
 
-        # 1. Save to Cosmos DB (Primary Interaction Store)
+        user_message = state.get("user_query") or state["query"]
+
+        # For streaming responses the extracted_memory is always empty because
+        # the stream uses plain-text output (no JSON format).  Run a fast
+        # gpt-4o-mini extraction from the completed response text instead.
+        extracted_memory = state.get("extracted_memory") or {}
+        if _memory_is_empty(extracted_memory):
+            print(f"[MemExtract] Streaming path — extracting memory for {state.get('interaction_id')}")
+            extracted_memory = await azure_ai_service.extract_memory(
+                query=user_message,
+                response_text=state.get("response_text", ""),
+                language_name=raw_lang,
+            )
+
+        # 1. Save to Cosmos DB
         data = {
-            "user_id": state["user_id"],
-            "session_id": state["session_id"],
+            "user_id":        state["user_id"],
+            "session_id":     state["session_id"],
             "interaction_id": state["interaction_id"],
-            "user_message": state.get("user_query") or state["query"],
-            "ai_response": state["response_text"],
-            "language": language_code,
-            "blob_name": state.get("blob_name"),
-            "metadata": state.get("metadata", {}),
+            "user_message":   user_message,
+            "ai_response":    state["response_text"],
+            "language":       language_code,
+            "blob_name":      state.get("blob_name"),
+            "metadata":       state.get("metadata", {}),
         }
         await cosmos_client.save_interaction(data)
-        
-        # 2. Save directly to Neo4j (Memory Graph)
-        # Using the memory ALREADY extracted by the same LLM call that answered the user!
+
+        # 2. Save to Neo4j — use freshly extracted memory
         await memory_pipeline.save_interaction_memory(
             user_id=state["user_id"],
             session_id=state["session_id"],
             interaction_id=state["interaction_id"],
-            user_message=state.get("user_query") or state["query"],
+            user_message=user_message,
             ai_response_text=state["response_text"],
-            extracted_memory=state.get("extracted_memory", {}),
-            prev_interaction_id=state.get("prev_interaction_id")
+            extracted_memory=extracted_memory,
+            prev_interaction_id=state.get("prev_interaction_id"),
+            language=language_code,
         )
     except Exception as e:
         import traceback

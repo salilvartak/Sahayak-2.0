@@ -24,21 +24,21 @@ class GraphClient:
 
     @staticmethod
     async def _setup_schema(tx):
-        """Constraints + indexes so every MERGE on a named node uses an index scan."""
         cmds = [
-            "CREATE CONSTRAINT user_id_unique IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
-            "CREATE CONSTRAINT interaction_id_unique IF NOT EXISTS FOR (i:Interaction) REQUIRE i.id IS UNIQUE",
-            # Indexes prevent full-label scans on every MERGE
-            "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)",
-            "CREATE INDEX topic_name  IF NOT EXISTS FOR (t:Topic)  ON (t.name)",
-            "CREATE INDEX intent_name IF NOT EXISTS FOR (n:Intent)  ON (n.name)",
+            # Uniqueness constraints
+            "CREATE CONSTRAINT user_id_unique        IF NOT EXISTS FOR (u:User)        REQUIRE u.id   IS UNIQUE",
+            "CREATE CONSTRAINT session_id_unique     IF NOT EXISTS FOR (s:Session)     REQUIRE s.id   IS UNIQUE",
+            "CREATE CONSTRAINT interaction_id_unique IF NOT EXISTS FOR (i:Interaction) REQUIRE i.id   IS UNIQUE",
+            "CREATE CONSTRAINT category_name_unique  IF NOT EXISTS FOR (c:Category)    REQUIRE c.name IS UNIQUE",
+            # Indexed lookups
+            "CREATE INDEX entity_name   IF NOT EXISTS FOR (e:Entity)  ON (e.name)",
+            "CREATE INDEX keyword_value IF NOT EXISTS FOR (k:Keyword)  ON (k.value)",
+            "CREATE INDEX intent_name   IF NOT EXISTS FOR (n:Intent)   ON (n.name)",
         ]
         for cmd in cmds:
             await (await tx.run(cmd)).consume()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
     async def _safe_run(self, func, *args, **kwargs):
         if not self._driver:
@@ -53,67 +53,88 @@ class GraphClient:
 
     @staticmethod
     def _normalize(text: str) -> str:
-        """Lowercase + strip so 'Paracetamol' and 'paracetamol' share one node."""
-        return text.strip().lower()
+        return (text or "").strip().lower()
 
     @staticmethod
     def _sanitize_entities(raw: list) -> list:
+        """Deduplicate entities, preserve original casing."""
         seen, out = set(), []
         for ent in raw:
             if isinstance(ent, dict):
-                name = ent.get("name", "").strip().lower()
-                etype = ent.get("type", "General")
+                name  = (ent.get("name") or "").strip()
+                etype = (ent.get("type") or "General").strip()
             elif isinstance(ent, str):
-                name = ent.strip().lower()
-                etype = "General"
+                name, etype = ent.strip(), "General"
             else:
                 continue
-            if name and name not in seen:
-                seen.add(name)
+            key = name.lower()
+            if name and key not in seen:
+                seen.add(key)
                 out.append({"name": name, "type": etype})
         return out
 
     @staticmethod
     def _co_occurrence_pairs(entities: list) -> list:
-        """All unique ordered pairs for CO_OCCURS_WITH edges."""
+        names = [e["name"].lower() for e in entities]
         pairs = []
-        names = [e["name"] for e in entities]
         for i in range(len(names)):
             for j in range(i + 1, len(names)):
                 a, b = names[i], names[j]
                 pairs.append({"a": min(a, b), "b": max(a, b)})
         return pairs
 
-    # ------------------------------------------------------------------
-    # Public write
-    # ------------------------------------------------------------------
+    # ── Public write ──────────────────────────────────────────────────────────
 
     async def update_graph(self, data: dict):
         return await self._safe_run(self._update_graph_impl, data)
 
     async def _update_graph_impl(self, data: dict):
-        # Normalise at Python level — one place, consistent everywhere
-        topic  = self._normalize(data.get("topic",  "") or "")
-        intent = self._normalize(data.get("intent", "") or "")
-        entities = self._sanitize_entities(data.get("entities", []))
-        pairs    = self._co_occurrence_pairs(entities)
+        # category = canonical domain (healthcare / products / …) — max 9 values
+        category  = self._normalize(data.get("category", "") or "")
+        sub_topic = self._normalize(data.get("sub_topic", "") or "")
+        intent    = self._normalize(data.get("intent",   "") or "")
+        entities  = self._sanitize_entities(data.get("entities", []))
+        pairs     = self._co_occurrence_pairs(entities)
+        keywords  = [
+            kw.strip().lower() for kw in (data.get("keywords") or [])
+            if isinstance(kw, str) and kw.strip()
+        ][:6]
 
-        norm = {**data, "topic": topic, "intent": intent}
+        norm = {**data, "category": category, "sub_topic": sub_topic, "intent": intent}
 
         async with self._driver.session() as session:
             try:
-                await session.execute_write(self._create_base_nodes_tx, norm)
-                await session.execute_write(
-                    self._create_interaction_full_tx, norm, entities, pairs
-                )
-                print(f"[Graph] updated {data['interaction_id']}")
+                # 1. User + Session nodes
+                await session.execute_write(self._write_base_tx, norm)
+
+                # 2. Interaction + Intent + Category chain + FOLLOWS
+                await session.execute_write(self._write_interaction_tx, norm)
+
+                # 3. User interest (separate tx so Category node is committed first)
+                if category:
+                    await session.execute_write(self._write_interest_tx, norm)
+
+                # 4. Entities
+                if entities:
+                    await session.execute_write(self._write_entities_tx, norm, entities, category)
+
+                # 5. Entity co-occurrence
+                if pairs:
+                    await session.execute_write(self._write_cooccurrence_tx, pairs)
+
+                # 6. Keywords
+                if keywords:
+                    await session.execute_write(self._write_keywords_tx, norm, keywords, category)
+
+                print(f"[Graph] updated {data['interaction_id']} "
+                      f"[cat={category} sub={sub_topic} kw={keywords[:3]}]")
                 return True
             except Exception as e:
                 print(f"[Graph] FAILED {data['interaction_id']}: {e}")
                 raise
 
     @staticmethod
-    async def _create_base_nodes_tx(tx, data: dict):
+    async def _write_base_tx(tx, data: dict):
         await (await tx.run(
             """
             MERGE (u:User {id: $user_id})
@@ -125,13 +146,19 @@ class GraphClient:
         )).consume()
 
     @staticmethod
-    async def _create_interaction_full_tx(tx, data: dict, entities: list, pairs: list):
-        # ── 1. Interaction node + intent + weighted topic interest + chain ──
+    async def _write_interaction_tx(tx, data: dict):
+        """Core interaction node + optional Intent + Category + FOLLOWS chain."""
         await (await tx.run(
             """
             MATCH (s:Session {id: $session_id})
+
             MERGE (i:Interaction {id: $interaction_id})
-            SET i.timestamp = datetime()
+            SET i.timestamp       = datetime(),
+                i.user_message    = coalesce($user_message, ""),
+                i.language        = coalesce($language, ""),
+                i.response_length = coalesce($response_length, 0),
+                i.topic           = coalesce($sub_topic, ""),
+                i.category        = coalesce($category, "")
             MERGE (s)-[:HAS_INTERACTION]->(i)
 
             WITH i
@@ -143,17 +170,9 @@ class GraphClient:
 
             WITH i
             CALL (i) {
-              WITH i WHERE $topic <> ""
-              MERGE (t:Topic {name: $topic})
-              MERGE (i)-[:RELATES_TO]->(t)
-              WITH t, i
-              MATCH (u:User)-[:HAS_SESSION]->(:Session)-[:HAS_INTERACTION]->(i)
-              MERGE (u)-[r:INTERESTED_IN]->(t)
-              ON CREATE SET r.weight = 1,
-                            r.first_seen = datetime(),
-                            r.last_seen  = datetime()
-              ON MATCH  SET r.weight    = r.weight + 1,
-                            r.last_seen = datetime()
+              WITH i WHERE $category <> ""
+              MERGE (c:Category {name: $category})
+              MERGE (i)-[:IN_CATEGORY]->(c)
             }
 
             WITH i
@@ -165,51 +184,107 @@ class GraphClient:
 
             RETURN i
             """,
-            session_id=data["session_id"],
-            interaction_id=data["interaction_id"],
-            intent=data.get("intent", ""),
-            topic=data.get("topic", ""),
-            prev_id=data.get("prev_interaction_id"),
+            session_id      = data["session_id"],
+            interaction_id  = data["interaction_id"],
+            user_message    = data.get("user_message", ""),
+            language        = data.get("language", ""),
+            response_length = data.get("response_length", 0),
+            intent          = data.get("intent", ""),
+            sub_topic       = data.get("sub_topic", ""),
+            category        = data.get("category", ""),
+            prev_id         = data.get("prev_interaction_id"),
         )).consume()
 
-        # ── 2. Entities + BELONGS_TO topic taxonomy ──
-        if entities:
-            await (await tx.run(
-                """
-                UNWIND $entities AS ent
-                MATCH (i:Interaction {id: $interaction_id})
-                MERGE (e:Entity {name: ent.name})
-                SET e.type = coalesce(ent.type, "General")
-                MERGE (i)-[:MENTIONS]->(e)
-                WITH e
-                WHERE $topic <> ""
-                MATCH (t:Topic {name: $topic})
-                MERGE (e)-[:BELONGS_TO]->(t)
-                """,
-                interaction_id=data["interaction_id"],
-                entities=entities,
-                topic=data.get("topic", ""),
-            )).consume()
+    @staticmethod
+    async def _write_interest_tx(tx, data: dict):
+        """
+        User -[:INTERESTED_IN]-> Category  (weighted, tracks sub_topics array).
+        Runs after _write_interaction_tx so Category node is guaranteed to exist.
+        Simple direct lookup — no chain traversal.
+        """
+        await (await tx.run(
+            """
+            MATCH (u:User {id: $user_id})
+            MATCH (c:Category {name: $category})
+            MERGE (u)-[r:INTERESTED_IN]->(c)
+            ON CREATE SET r.weight     = 1,
+                          r.first_seen = datetime(),
+                          r.last_seen  = datetime(),
+                          r.topics     = CASE WHEN $sub_topic <> "" THEN [$sub_topic] ELSE [] END
+            ON MATCH  SET r.weight     = r.weight + 1,
+                          r.last_seen  = datetime(),
+                          r.topics     = CASE
+                            WHEN $sub_topic = ""
+                              THEN coalesce(r.topics, [])
+                            WHEN $sub_topic IN coalesce(r.topics, [])
+                              THEN r.topics
+                            ELSE coalesce(r.topics, []) + [$sub_topic]
+                          END
+            """,
+            user_id   = data["user_id"],
+            category  = data["category"],
+            sub_topic = data.get("sub_topic", ""),
+        )).consume()
 
-        # ── 3. Entity co-occurrence edges (richer cross-entity relationships) ──
-        if pairs:
-            await (await tx.run(
-                """
-                UNWIND $pairs AS pair
-                MATCH (e1:Entity {name: pair.a}), (e2:Entity {name: pair.b})
-                MERGE (e1)-[r:CO_OCCURS_WITH]->(e2)
-                ON CREATE SET r.count = 1
-                ON MATCH  SET r.count = r.count + 1
-                """,
-                pairs=pairs,
-            )).consume()
+    @staticmethod
+    async def _write_entities_tx(tx, data: dict, entities: list, category: str):
+        """Entity nodes with type + MENTIONS from Interaction + BELONGS_TO Category."""
+        await (await tx.run(
+            """
+            UNWIND $entities AS ent
+            MERGE (e:Entity {name: ent.name})
+            SET e.type = ent.type
+            WITH e
+            MATCH (i:Interaction {id: $interaction_id})
+            MERGE (i)-[:MENTIONS]->(e)
+            WITH e
+            WHERE $category <> ""
+            MATCH (c:Category {name: $category})
+            MERGE (e)-[:BELONGS_TO]->(c)
+            """,
+            interaction_id = data["interaction_id"],
+            entities       = entities,
+            category       = category,
+        )).consume()
 
-    # ------------------------------------------------------------------
-    # Public reads
-    # ------------------------------------------------------------------
+    @staticmethod
+    async def _write_cooccurrence_tx(tx, pairs: list):
+        """Weighted co-occurrence edges between entities."""
+        await (await tx.run(
+            """
+            UNWIND $pairs AS pair
+            MATCH (e1:Entity {name: pair.a}), (e2:Entity {name: pair.b})
+            MERGE (e1)-[r:CO_OCCURS_WITH]->(e2)
+            ON CREATE SET r.count = 1
+            ON MATCH  SET r.count = r.count + 1
+            """,
+            pairs=pairs,
+        )).consume()
+
+    @staticmethod
+    async def _write_keywords_tx(tx, data: dict, keywords: list, category: str):
+        """Keyword nodes linked to Interaction and optionally to Category."""
+        await (await tx.run(
+            """
+            UNWIND $keywords AS kw
+            MERGE (k:Keyword {value: kw})
+            WITH k
+            MATCH (i:Interaction {id: $interaction_id})
+            MERGE (i)-[:TAGGED_WITH]->(k)
+            WITH k
+            WHERE $category <> ""
+            MATCH (c:Category {name: $category})
+            MERGE (k)-[:KEYWORD_OF]->(c)
+            """,
+            keywords       = keywords,
+            interaction_id = data["interaction_id"],
+            category       = category,
+        )).consume()
+
+    # ── Public reads ──────────────────────────────────────────────────────────
 
     async def get_routing_signals(self, session_id: str) -> dict:
-        """Depth + continuity via simple aggregation — no variable-length paths."""
+        """Session depth + continuity score."""
         if not self._driver:
             return {"depth": 0, "continuity": 0.0}
         async with self._driver.session() as session:
@@ -225,39 +300,94 @@ class GraphClient:
             if rec and rec["depth"] > 0:
                 depth = rec["depth"]
                 return {
-                    "depth": depth,
+                    "depth":      depth,
                     "continuity": min(rec["chained"] / depth, 1.0),
                 }
         return {"depth": 0, "continuity": 0.0}
 
     async def get_related_context(self, user_id: str, query: str, limit: int = 5) -> dict:
-        """Topics ranked by interest weight + recency; entities from last 30 days."""
+        """
+        Returns routing context based on User→INTERESTED_IN→Category edges
+        and recent Interaction properties (topic, category stored on node).
+        """
         if not self._driver:
-            return {"topics": [], "entities": []}
+            return {"topics": [], "entities": [], "sub_topics": [],
+                    "dominant_category": None, "recent_intents": [], "entity_types": []}
+
         async with self._driver.session() as session:
             result = await session.run(
                 """
                 MATCH (u:User {id: $user_id})
-                OPTIONAL MATCH (u)-[r:INTERESTED_IN]->(t:Topic)
-                WITH u, t, r
-                ORDER BY r.weight DESC, r.last_seen DESC
-                WITH u, collect(t.name) AS topics
+
+                // ── Weighted category interests ────────────────────────────
+                OPTIONAL MATCH (u)-[r:INTERESTED_IN]->(c:Category)
+                WITH u,
+                     collect({
+                       name:      c.name,
+                       weight:    coalesce(r.weight, 0),
+                       last_seen: r.last_seen,
+                       topics:    coalesce(r.topics, [])
+                     }) AS cat_rows
+
+                // ── Recent interactions (30-day window) ───────────────────
                 OPTIONAL MATCH (u)-[:HAS_SESSION]->(:Session)
                     -[:HAS_INTERACTION]->(i:Interaction)
-                    -[:MENTIONS]->(e:Entity)
                 WHERE i.timestamp >= datetime() - duration({days: 30})
-                RETURN topics, collect(DISTINCT {name: e.name, type: e.type}) AS entities
+
+                OPTIONAL MATCH (i)-[:MENTIONS]->(e:Entity)
+                OPTIONAL MATCH (i)-[:HAS_INTENT]->(n:Intent)
+
+                RETURN cat_rows,
+                       collect(DISTINCT i.topic)[..8]            AS recent_topics,
+                       collect(DISTINCT {name: e.name, type: e.type}) AS entities,
+                       collect(DISTINCT n.name)[..5]             AS recent_intents
                 """,
                 user_id=user_id,
             )
             rec = await result.single()
-            if rec:
-                entities = [e for e in (rec["entities"] or []) if e.get("name")]
-                return {
-                    "topics":   rec["topics"][:limit],
-                    "entities": entities[:limit],
-                }
-        return {"topics": [], "entities": []}
+            if not rec:
+                return {"topics": [], "entities": [], "sub_topics": [],
+                        "dominant_category": None, "recent_intents": [], "entity_types": []}
+
+            # Sort categories by weight desc
+            cat_rows = sorted(
+                [r for r in (rec["cat_rows"] or []) if r.get("name")],
+                key=lambda r: -(r.get("weight") or 0),
+            )
+
+            # Dominant category = highest weight
+            dominant_category = cat_rows[0]["name"] if cat_rows else None
+
+            # Collect sub_topics from top categories' topics arrays
+            seen_st, sub_topics = set(), []
+            for row in cat_rows[:3]:
+                for t in (row.get("topics") or []):
+                    if t and t not in seen_st:
+                        seen_st.add(t)
+                        sub_topics.append(t)
+
+            # Also include recent topics from Interaction properties
+            for t in (rec["recent_topics"] or []):
+                if t and t not in seen_st:
+                    seen_st.add(t)
+                    sub_topics.append(t)
+
+            category_names = [r["name"] for r in cat_rows[:limit]]
+
+            entities = [e for e in (rec["entities"] or []) if e.get("name")]
+            entity_names = [e["name"] for e in entities[:limit * 2]]
+            entity_types = list(dict.fromkeys(
+                e["type"] for e in entities if e.get("type") and e["type"] != "General"
+            ))
+
+            return {
+                "topics":            category_names,
+                "sub_topics":        sub_topics[:limit],
+                "dominant_category": dominant_category,
+                "entities":          entity_names[:limit],
+                "entity_types":      entity_types[:4],
+                "recent_intents":    [i for i in (rec["recent_intents"] or []) if i][:4],
+            }
 
 
 graph_client = GraphClient()

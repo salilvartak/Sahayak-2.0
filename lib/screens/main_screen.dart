@@ -1,6 +1,8 @@
 import 'dart:math' as math;
 import 'dart:async';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/conversation_provider.dart';
 import '../widgets/camera_preview_widget.dart';
@@ -61,7 +63,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
   }
 
   void _showTutorial() {
-    const language = Language.english;
+    final language = _tutorialLanguageFromDevice();
     final localizations = AppLocalizations(language);
     final tts = ref.read(ttsServiceProvider);
     final settings = ref.read(settingsProvider);
@@ -81,18 +83,21 @@ class _MainScreenState extends ConsumerState<MainScreen>
       final title = localizations.translate(titleKey);
       final desc = localizations.translate(descKey);
       final isLast = identify == stepIds.last;
-      final gestureHint = isLast
-          ? "Single tap this avatar to hear this step again. Double tap this avatar to finish the tutorial."
-          : "Single tap this avatar to repeat this instruction. Double tap this avatar to go to the next step.";
+      final isWelcome = identify == stepIds.first;
+      final gestureHint = (isWelcome || isLast)
+          ? _tutorialGestureHint(language, isLast: isLast)
+          : '';
 
-      final detailedMessage =
-          "$title. $desc. $gestureHint This guide is detailed. Take your time and follow each step.";
+      final detailedMessage = gestureHint.isEmpty
+          ? "$title. $desc. ${_tutorialDetailTail(language)}"
+          : "$title. $desc. $gestureHint ${_tutorialDetailTail(language)}";
       await tts.speak(detailedMessage, language);
     }
 
     void repeatCurrentStep(String identify) {
       final keys = tutorialKeysMap[identify];
       if (keys != null) {
+        tts.stop();
         unawaited(speakTutorial(keys[0], keys[1], identify));
       }
     }
@@ -196,6 +201,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
       beforeFocus: (target) {
         final keys = tutorialKeysMap[target.identify];
         if (keys != null) {
+          tts.stop();
           unawaited(speakTutorial(keys[0], keys[1], target.identify));
         }
       },
@@ -219,6 +225,48 @@ class _MainScreenState extends ConsumerState<MainScreen>
     tutorialCoachMark.show(context: context);
   }
 
+  Language _tutorialLanguageFromDevice() {
+    final code = ui.PlatformDispatcher.instance.locale.languageCode.toLowerCase();
+    for (final language in Language.values) {
+      if (language.code == code) return language;
+    }
+    return Language.english;
+  }
+
+  String _tutorialGestureHint(Language language, {required bool isLast}) {
+    switch (language) {
+      case Language.hindi:
+        return isLast
+            ? "इस आइकन पर एक बार टैप करें, निर्देश दोबारा सुने। डबल टैप करें, ट्यूटोरियल पूरा करें।"
+            : "इस आइकन पर एक बार टैप करें, निर्देश दोबारा सुने। डबल टैप करें, अगले स्टेप पर जाएं।";
+      case Language.marathi:
+        return isLast
+            ? "या आयकॉनवर एकदा टॅप करा, सूचना पुन्हा ऐका. डबल टॅप करा, ट्यूटोरियल पूर्ण करा."
+            : "या आयकॉनवर एकदा टॅप करा, सूचना पुन्हा ऐका. डबल टॅप करा, पुढच्या स्टेपला जा.";
+      case Language.telugu:
+        return isLast
+            ? "ఈ ఐకాన్‌పై ఒకసారి ట్యాప్ చేస్తే సూచన మళ్లీ వింటారు. డబుల్ ట్యాప్ చేస్తే ట్యుటోరియల్ పూర్తవుతుంది."
+            : "ఈ ఐకాన్‌పై ఒకసారి ట్యాప్ చేస్తే సూచన మళ్లీ వింటారు. డబుల్ ట్యాప్ చేస్తే తదుపరి దశకు వెళ్తారు.";
+      default:
+        return isLast
+            ? "Single tap this avatar to hear this step again. Double tap this avatar to finish the tutorial."
+            : "Single tap this avatar to repeat this instruction. Double tap this avatar to go to the next step.";
+    }
+  }
+
+  String _tutorialDetailTail(Language language) {
+    switch (language) {
+      case Language.hindi:
+        return "यह गाइड थोड़ी विस्तार से है। आराम से हर स्टेप फॉलो करें।";
+      case Language.marathi:
+        return "ही मार्गदर्शिका थोडी सविस्तर आहे. शांतपणे प्रत्येक स्टेप फॉलो करा.";
+      case Language.telugu:
+        return "ఈ గైడ్ కొంచెం వివరంగా ఉంటుంది. ఆతురపడకుండా ప్రతి దశను అనుసరించండి.";
+      default:
+        return "This guide is detailed. Take your time and follow each step.";
+    }
+  }
+
   Widget _buildTutorialStepContent(
     TutorialCoachMarkController controller,
     {
@@ -226,6 +274,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
     required VoidCallback onRepeat,
     bool isLast = false,
   }) {
+    final tts = ref.read(ttsServiceProvider);
     return SizedBox(
       width: MediaQuery.of(context).size.width,
       height: 300,
@@ -235,6 +284,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
           _TutorialSpeakingAvatar(
             onSingleTap: onRepeat,
             onDoubleTap: () {
+              tts.stop();
               if (isLast) {
                 ref.read(settingsProvider.notifier).setTutorialCompleted(true);
                 controller.skip();
@@ -242,28 +292,6 @@ class _MainScreenState extends ConsumerState<MainScreen>
                 controller.next();
               }
             },
-          ),
-          const SizedBox(height: 22),
-          Text(
-            isLast
-                ? 'Tap avatar: repeat  |  Double tap: finish'
-                : 'Tap avatar: repeat  |  Double tap: next',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white.withOpacity(0.78),
-              fontSize: 13,
-              letterSpacing: 0.3,
-              fontWeight: FontWeight.w400,
-            ),
-          ),
-          const SizedBox(height: 10),
-          Text(
-            identify.toUpperCase(),
-            style: TextStyle(
-              color: Colors.white.withOpacity(0.5),
-              fontSize: 11,
-              letterSpacing: 1.8,
-            ),
           ),
         ],
       ),
@@ -286,6 +314,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
       body: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: () {
+          HapticFeedback.selectionClick();
           ref.read(conversationProvider.notifier).clearResponse();
         },
         child: Stack(
@@ -462,6 +491,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
       actions: [
         GestureDetector(
           onTap: () {
+            HapticFeedback.selectionClick();
             setState(() {
               _isSilentMode = !_isSilentMode;
             });
@@ -482,7 +512,10 @@ class _MainScreenState extends ConsumerState<MainScreen>
           ),
         ),
         GestureDetector(
-          onTap: () => Navigator.pushNamed(context, '/history'),
+          onTap: () {
+            HapticFeedback.lightImpact();
+            Navigator.pushNamed(context, '/history');
+          },
           child: Container(
             key: _historyKey,
             margin: const EdgeInsets.only(right: 8),
