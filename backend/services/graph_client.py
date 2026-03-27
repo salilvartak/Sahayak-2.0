@@ -14,7 +14,10 @@ class GraphClient:
             self._driver = AsyncGraphDatabase.driver(
                 settings.NEO4J_URI,
                 auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD),
-                max_connection_lifetime=600,
+                max_connection_lifetime=90,   # recycle before AuraDB server closes (~30s idle)
+                max_connection_pool_size=5,
+                connection_timeout=15,
+                keep_alive=True,
             )
             async with self._driver.session() as session:
                 await session.execute_write(self._setup_schema)
@@ -43,13 +46,22 @@ class GraphClient:
     async def _safe_run(self, func, *args, **kwargs):
         if not self._driver:
             await self.init()
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            if "10054" in str(e) or "defunct" in str(e).lower():
-                await self.init()
+        for attempt in range(2):
+            try:
                 return await func(*args, **kwargs)
-            raise
+            except Exception as e:
+                err = str(e)
+                is_connection_err = (
+                    "10054" in err
+                    or "defunct" in err.lower()
+                    or "connection reset" in err.lower()
+                    or "broken pipe" in err.lower()
+                )
+                if is_connection_err and attempt == 0:
+                    # Driver will open a fresh connection from pool on next attempt
+                    print(f"[Graph] Connection reset — retrying once...")
+                    continue
+                raise
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -103,35 +115,34 @@ class GraphClient:
         norm = {**data, "category": category, "sub_topic": sub_topic, "intent": intent}
 
         async with self._driver.session() as session:
-            try:
-                # 1. User + Session nodes
-                await session.execute_write(self._write_base_tx, norm)
+            # Each write is independent — a failure in enrichment (keywords/entities)
+            # never rolls back the core Interaction node.
+            saved, failed = [], []
 
-                # 2. Interaction + Intent + Category chain + FOLLOWS
-                await session.execute_write(self._write_interaction_tx, norm)
+            async def _run(label: str, coro):
+                try:
+                    await coro
+                    saved.append(label)
+                except Exception as e:
+                    failed.append(f"{label}:{e}")
 
-                # 3. User interest (separate tx so Category node is committed first)
-                if category:
-                    await session.execute_write(self._write_interest_tx, norm)
+            # 1. Core — must succeed; if this fails, propagate so _safe_run can retry
+            await session.execute_write(self._write_base_tx, norm)
+            await session.execute_write(self._write_interaction_tx, norm)
 
-                # 4. Entities
-                if entities:
-                    await session.execute_write(self._write_entities_tx, norm, entities, category)
+            # 2. Enrichment — best-effort; individual failures don't abort the rest
+            if category:
+                await _run("interest", session.execute_write(self._write_interest_tx, norm))
+            if entities:
+                await _run("entities", session.execute_write(self._write_entities_tx, norm, entities, category))
+            if pairs:
+                await _run("cooccur", session.execute_write(self._write_cooccurrence_tx, pairs))
+            if keywords:
+                await _run("keywords", session.execute_write(self._write_keywords_tx, norm, keywords, category))
 
-                # 5. Entity co-occurrence
-                if pairs:
-                    await session.execute_write(self._write_cooccurrence_tx, pairs)
-
-                # 6. Keywords
-                if keywords:
-                    await session.execute_write(self._write_keywords_tx, norm, keywords, category)
-
-                print(f"[Graph] updated {data['interaction_id']} "
-                      f"[cat={category} sub={sub_topic} kw={keywords[:3]}]")
-                return True
-            except Exception as e:
-                print(f"[Graph] FAILED {data['interaction_id']}: {e}")
-                raise
+            status = f"saved={saved}" + (f" | skipped={failed}" if failed else "")
+            print(f"[Graph] {data['interaction_id']} [{status}]")
+            return True
 
     @staticmethod
     async def _write_base_tx(tx, data: dict):

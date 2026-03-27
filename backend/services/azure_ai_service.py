@@ -7,6 +7,36 @@ import httpx
 from config import settings
 from prompts import system_prompt
 
+def _find_json_block(text: str) -> str | None:
+    """Return the first complete {...} block using brace counting.
+    More reliable than greedy regex which can overshoot the closing brace."""
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def _log(msg: str):
     """Force-flushed, encoding-safe print for Windows terminals (cp1252 safe)."""
     try:
@@ -241,9 +271,9 @@ class AzureAIService:
         { "entities": [...], "intent": "...", "topic": "...",
           "sub_topic": "...", "keywords": [...] }
         """
-        # Truncate to keep the prompt small and cheap
-        q = (query or "")[:300]
-        r = (response_text or "")[:600]
+        # Keep inputs small so the 700-token output budget is enough for the JSON
+        q = (query or "")[:200]
+        r = (response_text or "")[:400]
 
         extraction_prompt = f"""Extract structured memory from this conversation. Return ONLY valid JSON, nothing else.
 
@@ -266,7 +296,7 @@ JSON format required:
                 {"role": "user",   "content": extraction_prompt},
             ],
             "temperature": 0.0,
-            "max_tokens":  500,
+            "max_tokens":  700,
             # No response_format — it makes the model wrap JSON in {"final": "...escaped string..."}
         }
         headers = {"api-key": self.api_key, "Content-Type": "application/json"}
@@ -289,16 +319,16 @@ JSON format required:
             if raw.startswith("```"):
                 raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
 
-            # Try direct parse first, then fall back to regex extraction
+            # Try direct parse first, then brace-counting extraction
             memory = None
             try:
                 memory = json.loads(raw)
             except json.JSONDecodeError:
-                m = re.search(r"\{.*\}", raw, re.DOTALL)
-                if not m:
+                block = _find_json_block(raw)
+                if block is None:
                     _log(f"[MemExtract] No JSON found in: {raw[:120]}")
                     return {}
-                memory = json.loads(m.group())
+                memory = json.loads(block)
 
             # Unwrap if LLM nested result under a wrapper key ("final", "memory", "result", etc.)
             # Also handles when the wrapper value is itself an escaped JSON string

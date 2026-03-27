@@ -204,10 +204,6 @@ class MemoryPipeline:
                 "recent_intents":     context_data.get("recent_intents", []),
                 "entities_mentioned": context_data.get("entities", []),
                 "entity_types":       context_data.get("entity_types", []),
-                "user_interests":     context_data.get("topics", []),
-                "inferred_domain":    context_data.get("dominant_category"),
-                "expertise_hint":     "unknown",
-                "last_model_used":    None,
             }
         except Exception as e:
             print(f"Error building routing context: {e}")
@@ -220,10 +216,6 @@ class MemoryPipeline:
                 "recent_intents":    [],
                 "entities_mentioned": [],
                 "entity_types":      [],
-                "user_interests":    [],
-                "inferred_domain":   None,
-                "expertise_hint":    "unknown",
-                "last_model_used":   None,
             }
 
 

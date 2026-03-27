@@ -1,7 +1,5 @@
-from typing import TypedDict, Annotated, List, Optional
+from typing import TypedDict, Optional
 import json
-import uuid
-from langgraph.graph import StateGraph, END
 from services.azure_ai_service import azure_ai_service
 from services.cosmos_client import cosmos_client
 from services.memory_pipeline import memory_pipeline
@@ -21,7 +19,6 @@ class AgentState(TypedDict):
     metadata: dict
     prev_interaction_id: Optional[str]
     blob_name: Optional[str]
-    # PART 7 — Interrupt context
     was_interruption: Optional[bool]
     partial_response: Optional[str]
     previous_intent: Optional[str]
@@ -121,6 +118,10 @@ async def build_streaming_context(state: AgentState) -> tuple:
     )
     model, prompt = _route_request(state, routing_context, streaming=True)
 
+    # Inject product context from barcode scan into system prompt (not user message)
+    if state.get("product_context"):
+        prompt += f"\n\n{state['product_context']}"
+
     # Inject interrupt context if applicable
     if state.get("was_interruption") and state.get("partial_response"):
         partial = state["partial_response"][:300]
@@ -148,7 +149,11 @@ async def call_llm_node(state: AgentState):
     # 2. Python-based routing — no extra LLM call
     selected_model, enriched_prompt = _route_request(state, routing_context)
 
-    # 3. Inject interrupt context if applicable
+    # 3. Inject product context from barcode scan into system prompt (not user message)
+    if state.get("product_context"):
+        enriched_prompt += f"\n\n{state['product_context']}"
+
+    # 4. Inject interrupt context if applicable
     if state.get("was_interruption") and state.get("partial_response"):
         partial = state["partial_response"][:300]
         enriched_prompt += (
@@ -157,7 +162,7 @@ async def call_llm_node(state: AgentState):
             "Continue naturally — acknowledge the interruption only if helpful.]"
         )
 
-    # 4. Single LLM call to the workhorse model
+    # 5. Single LLM call to the workhorse model
     combined_result = await azure_ai_service.get_response_with_custom_prompt(
         prompt=state["query"],
         image_bytes=state["image_bytes"],
@@ -264,21 +269,3 @@ async def history_write_node(state: AgentState):
     
     return state
 
-# --- Pipeline Definition ---
-
-def create_agent_graph():
-    workflow = StateGraph(AgentState)
-
-    # Add nodes
-    workflow.add_node("call_llm", call_llm_node)
-    workflow.add_node("history_write", history_write_node)
-
-    # Add edges
-    workflow.set_entry_point("call_llm")
-    workflow.add_edge("call_llm", "history_write")
-    workflow.add_edge("history_write", END)
-
-    return workflow.compile()
-
-# Global compiled graph
-agent_graph = create_agent_graph()

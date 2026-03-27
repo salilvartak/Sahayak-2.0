@@ -27,6 +27,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
   final GlobalKey _micKey = GlobalKey();
   final GlobalKey _cameraKey = GlobalKey();
   final GlobalKey _flashKey = GlobalKey();
+  final GlobalKey _cameraToggleKey = GlobalKey();
   final GlobalKey _orbKey = GlobalKey();
   final GlobalKey _historyKey = GlobalKey();
   final TextEditingController _textController = TextEditingController();
@@ -69,14 +70,15 @@ class _MainScreenState extends ConsumerState<MainScreen>
     final settings = ref.read(settingsProvider);
     tts.setSpeed('Slow');
 
-    final List<String> stepIds = ['welcome', 'mic', 'camera', 'flash', 'orb', 'history'];
+    final List<String> stepIds = ['welcome', 'mic', 'camera', 'flash', 'orb', 'history', 'camera_off'];
     final Map<String, List<String>> tutorialKeysMap = {
-      'welcome': ['tutorial_welcome_title', 'tutorial_welcome_desc'],
-      'mic': ['tutorial_mic_title', 'tutorial_mic_desc'],
-      'camera': ['tutorial_camera_title', 'tutorial_camera_desc'],
-      'flash': ['tutorial_flash_title', 'tutorial_flash_desc'],
-      'orb': ['tutorial_orb_title', 'tutorial_orb_desc'],
-      'history': ['tutorial_history_title', 'tutorial_history_desc'],
+      'welcome':    ['tutorial_welcome_title',    'tutorial_welcome_desc'],
+      'mic':        ['tutorial_mic_title',         'tutorial_mic_desc'],
+      'camera':     ['tutorial_camera_title',      'tutorial_camera_desc'],
+      'flash':      ['tutorial_flash_title',       'tutorial_flash_desc'],
+      'orb':        ['tutorial_orb_title',         'tutorial_orb_desc'],
+      'history':    ['tutorial_history_title',     'tutorial_history_desc'],
+      'camera_off': ['tutorial_camera_off_title',  'tutorial_camera_off_desc'],
     };
 
     Future<void> speakTutorial(String titleKey, String descKey, String identify) async {
@@ -189,6 +191,21 @@ class _MainScreenState extends ConsumerState<MainScreen>
               controller,
               identify: "history",
               onRepeat: () => repeatCurrentStep("history"),
+              isLast: false,
+            ),
+          ),
+        ],
+      ),
+      TargetFocus(
+        identify: "camera_off",
+        keyTarget: _cameraToggleKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialStepContent(
+              controller,
+              identify: "camera_off",
+              onRepeat: () => repeatCurrentStep("camera_off"),
               isLast: true,
             ),
           ),
@@ -307,10 +324,12 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
   @override
   Widget build(BuildContext context) {
+    final isCameraActive = ref.watch(conversationProvider).isCameraActive;
+
     return Scaffold(
       backgroundColor: Colors.black,
       extendBodyBehindAppBar: true,
-      appBar: _buildAppBar(context),
+      appBar: _buildAppBar(context, isCameraActive),
       body: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: () {
@@ -321,6 +340,23 @@ class _MainScreenState extends ConsumerState<MainScreen>
           children: [
             // Full-screen camera feed
             const Positioned.fill(child: CameraPreviewWidget()),
+
+            // Camera-off overlay — black screen with icon
+            if (!isCameraActive)
+              const Positioned.fill(
+                child: IgnorePointer(
+                  child: ColoredBox(
+                    color: Colors.black,
+                    child: Center(
+                      child: Icon(
+                        Icons.videocam_off_rounded,
+                        color: Color(0x3DFFFFFF),
+                        size: 64,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
 
             // Ambient dark overlay for depth
             Positioned.fill(
@@ -451,7 +487,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
     // Keep silent mode on, but the provider will update the status to thinking
   }
 
-  PreferredSizeWidget _buildAppBar(BuildContext context) {
+  PreferredSizeWidget _buildAppBar(BuildContext context, bool isCameraActive) {
     const language = Language.english;
     final localizations = AppLocalizations(language);
 
@@ -508,6 +544,33 @@ class _MainScreenState extends ConsumerState<MainScreen>
               _isSilentMode ? Icons.keyboard_rounded : Icons.keyboard_hide_rounded, 
               color: _isSilentMode ? const Color(0xFF6C8EFF) : Colors.white70, 
               size: 18
+            ),
+          ),
+        ),
+        GestureDetector(
+          onTap: () {
+            HapticFeedback.selectionClick();
+            ref.read(conversationProvider.notifier).toggleCameraActive();
+          },
+          child: Container(
+            key: _cameraToggleKey,
+            margin: const EdgeInsets.only(right: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(20),
+              color: isCameraActive
+                  ? Colors.white.withOpacity(0.08)
+                  : const Color(0xFFFF6B6B).withOpacity(0.15),
+              border: Border.all(
+                color: isCameraActive
+                    ? Colors.white.withOpacity(0.12)
+                    : const Color(0xFFFF6B6B).withOpacity(0.4),
+              ),
+            ),
+            child: Icon(
+              isCameraActive ? Icons.videocam_rounded : Icons.videocam_off_rounded,
+              color: isCameraActive ? Colors.white70 : const Color(0xFFFF6B6B),
+              size: 18,
             ),
           ),
         ),
@@ -708,7 +771,6 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
     with TickerProviderStateMixin {
   late AnimationController _pulseController;
   late AnimationController _rotateController;
-  late AnimationController _waveController;
 
   @override
   void initState() {
@@ -722,77 +784,39 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
       vsync: this,
       duration: const Duration(seconds: 12),
     )..repeat();
-
-    _waveController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    )..repeat(reverse: true);
-
   }
 
   @override
   void dispose() {
     _pulseController.dispose();
     _rotateController.dispose();
-    _waveController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final status = ref.watch(conversationProvider).status;
-    final bool isListening = status == AppState.listening;
-    final bool isThinking = status == AppState.thinking;
-    final bool isSpeaking = status == AppState.speaking;
-    final bool isActive = isListening || isThinking || isSpeaking;
-    const language = Language.english;
-    final localizations = AppLocalizations(language);
+    final bool isActive = status == AppState.listening || status == AppState.thinking || status == AppState.speaking;
 
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        // --- Outer ring glow when active ---
-        AnimatedContainer(
-          duration: const Duration(milliseconds: 600),
-          curve: Curves.easeOut,
-          width: isActive ? 220 : 0,
-          height: isActive ? 220 : 0,
-          child: isActive
-              ? AnimatedBuilder(
-                  animation: _rotateController,
-                  builder: (_, __) => Transform.rotate(
-                    angle: _rotateController.value * 2 * math.pi,
-                    child: CustomPaint(
-                      painter: _ArcRingPainter(
-                        color: _orbColor(status),
-                        progress: _pulseController.value,
-                      ),
-                    ),
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOut,
+      width: isActive ? 220 : 0,
+      height: isActive ? 220 : 0,
+      child: isActive
+          ? AnimatedBuilder(
+              animation: _rotateController,
+              builder: (context, child) => Transform.rotate(
+                angle: _rotateController.value * 2 * math.pi,
+                child: CustomPaint(
+                  painter: _ArcRingPainter(
+                    color: _orbColor(status),
+                    progress: _pulseController.value,
                   ),
-                )
-              : const SizedBox.shrink(),
-        ),
-
-        if (isActive) const SizedBox(height: 0)
-        else const SizedBox(height: 220),
-
-        // --- Status label ---
-        AnimatedSwitcher(
-          duration: const Duration(milliseconds: 400),
-          child: isActive
-              ? Text(
-                  _statusLabel(status, localizations),
-                  key: ValueKey(status),
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.75),
-                    fontSize: 13,
-                    fontWeight: FontWeight.w300,
-                    letterSpacing: 5,
-                  ),
-                )
-              : const SizedBox.shrink(),
-        ),
-      ],
+                ),
+              ),
+            )
+          : const SizedBox.shrink(),
     );
   }
 
@@ -809,18 +833,6 @@ class _VoiceOrbWidgetState extends ConsumerState<VoiceOrbWidget>
     }
   }
 
-  String _statusLabel(AppState? status, AppLocalizations localizations) {
-    switch (status) {
-      case AppState.listening:
-        return localizations.translate('listening').toUpperCase();
-      case AppState.thinking:
-        return localizations.translate('thinking').toUpperCase();
-      case AppState.speaking:
-        return localizations.translate('speaking').toUpperCase();
-      default:
-        return '';
-    }
-  }
 }
 
 /// Draws elegant dashed arc rings that rotate around the orb
@@ -867,58 +879,3 @@ class _ArcRingPainter extends CustomPainter {
   bool shouldRepaint(_ArcRingPainter old) => old.progress != progress || old.color != color;
 }
 
-// ---------------------------------------------------------------------------
-// Premium Waveform — used optionally inside listening state
-// ---------------------------------------------------------------------------
-
-class WaveformVisualizer extends StatefulWidget {
-  const WaveformVisualizer({super.key});
-
-  @override
-  State<WaveformVisualizer> createState() => _WaveformVisualizerState();
-}
-
-class _WaveformVisualizerState extends State<WaveformVisualizer>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _ctrl;
-
-  @override
-  void initState() {
-    super.initState();
-    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 700))
-      ..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _ctrl,
-      builder: (_, __) {
-        return Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: List.generate(7, (i) {
-            final t = _ctrl.value;
-            final phase = math.sin((i / 7) * math.pi + t * math.pi);
-            final h = 8.0 + phase.abs() * 28;
-            return Container(
-              margin: const EdgeInsets.symmetric(horizontal: 2.5),
-              width: 3,
-              height: h,
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.55 + phase.abs() * 0.45),
-                borderRadius: BorderRadius.circular(2),
-              ),
-            );
-          }),
-        );
-      },
-    );
-  }
-}

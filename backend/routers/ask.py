@@ -2,7 +2,6 @@ import uuid
 import asyncio
 from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
-from services.agent import agent_graph
 from services.blob_service import blob_service
 from services.cosmos_client import cosmos_client
 from services.azure_ai_service import azure_ai_service
@@ -19,7 +18,6 @@ async def ask(
     query: str = Form(...),
     language: str = Form(...),
     image: UploadFile = File(None),
-    # PART 7 — Interrupt context
     was_interruption: bool = Form(False),
     partial_response: str = Form(""),
     previous_intent: str = Form(""),
@@ -52,20 +50,13 @@ async def ask(
         
         product_data = await open_food_facts_service.fetch_product(barcode)
         product_context = open_food_facts_service.build_prompt_context(barcode, product_data) if barcode else ""
-        enriched_query = query
-        if product_context:
-            enriched_query = (
-                f"{query}\n\n"
-                "You also have trusted barcode product details below. Use them if relevant to the user question.\n"
-                f"{product_context}"
-            )
 
         # Prepare state for LangGraph pipeline
         state = {
             "user_id": device_id,
             "session_id": session_id,
             "interaction_id": interaction_id,
-            "query": enriched_query,
+            "query": query,
             "language": language,
             "image_bytes": image_bytes,
             "blob_name": blob_name,
@@ -133,19 +124,14 @@ async def ask_stream(
 
     product_data = await open_food_facts_service.fetch_product(barcode)
     product_context = open_food_facts_service.build_prompt_context(barcode, product_data) if barcode else ""
-    enriched_query = query
-    if product_context:
-        enriched_query = (
-            f"{query}\n\n"
-            "You also have trusted barcode product details below. Use them if relevant to the user question.\n"
-            f"{product_context}"
-        )
+    if barcode:
+        print(f"[ask/stream] barcode={barcode} | product={'found' if product_data else 'not in OFF'} | ctx={len(product_context)}chars", flush=True)
 
     state = {
         "user_id": device_id,
         "session_id": session_id,
         "interaction_id": interaction_id,
-        "query": enriched_query,
+        "query": query,
         "language": language,
         "image_bytes": image_bytes,
         "blob_name": blob_name,

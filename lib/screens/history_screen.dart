@@ -1,27 +1,149 @@
-import 'dart:io';
-import 'dart:ui';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:intl/intl.dart';
 import '../providers/conversation_provider.dart';
-import '../models/conversation_turn.dart';
 import '../models/language.dart';
+import '../localization/app_localizations.dart';
+import '../services/tts_service.dart';
 
-class HistoryScreen extends ConsumerWidget {
+class HistoryScreen extends ConsumerStatefulWidget {
   const HistoryScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final state = ref.watch(conversationProvider);
-    final history = state.history;
+  ConsumerState<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends ConsumerState<HistoryScreen>
+    with TickerProviderStateMixin {
+  int _index = 0;
+  bool _isPlaying = false;
+  int _playToken = 0;
+
+  late AnimationController _waveController;
+
+  @override
+  void initState() {
+    super.initState();
+    _waveController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+
+    WidgetsBinding.instance.addPostFrameCallback((_) => _announceCount());
+  }
+
+  @override
+  void dispose() {
+    _waveController.dispose();
+    super.dispose();
+  }
+
+  Language get _deviceLanguage {
+    final code = ui.PlatformDispatcher.instance.locale.languageCode.toLowerCase();
+    for (final lang in Language.values) {
+      if (lang.code == code) return lang;
+    }
+    return Language.english;
+  }
+
+  AppLocalizations get _loc => AppLocalizations(_deviceLanguage);
+
+  TTSService get _tts => ref.read(ttsServiceProvider);
+
+  void _stop() {
+    _playToken++;
+    _tts.stop();
+    if (mounted) {
+      setState(() => _isPlaying = false);
+      _waveController.stop();
+      _waveController.reset();
+    }
+  }
+
+  Future<void> _announceCount() async {
+    final history = ref.read(conversationProvider).history;
+    if (history.isEmpty) {
+      await _tts.speak(_loc.translate('history_empty'), _deviceLanguage);
+      return;
+    }
+    final msg = _loc.translate('history_count').replaceAll('{n}', '${history.length}');
+    final prompt = _loc.translate('history_play_prompt');
+    await _tts.speak('$msg $prompt', _deviceLanguage);
+  }
+
+  Future<void> _playCurrentTurn() async {
+    final history = ref.read(conversationProvider).history;
+    if (history.isEmpty) return;
+
+    _stop();
+    final token = ++_playToken;
+    final turn = history[_index];
+    final turnLang = Language.fromBcp47(turn.language);
+
+    setState(() => _isPlaying = true);
+    _waveController.repeat(reverse: true);
+
+    try {
+      // Announce "You asked:" in device language
+      await _tts.speak(_loc.translate('history_you_asked'), _deviceLanguage);
+      if (token != _playToken) return;
+
+      // Speak the user query in the turn's language
+      await _tts.speak(turn.query, turnLang);
+      if (token != _playToken) return;
+
+      // Announce "I said:" in device language
+      await _tts.speak(_loc.translate('history_i_said'), _deviceLanguage);
+      if (token != _playToken) return;
+
+      // Speak the AI response in the turn's language
+      await _tts.speak(turn.response, turnLang);
+    } finally {
+      if (token == _playToken && mounted) {
+        setState(() => _isPlaying = false);
+        _waveController.stop();
+        _waveController.reset();
+      }
+    }
+  }
+
+  Future<void> _navigate(int delta) async {
+    final history = ref.read(conversationProvider).history;
+    if (history.isEmpty) return;
+
+    _stop();
+    final newIndex = _index + delta;
+
+    if (newIndex < 0) {
+      await _tts.speak(_loc.translate('history_newest_reached'), _deviceLanguage);
+      return;
+    }
+    if (newIndex >= history.length) {
+      await _tts.speak(_loc.translate('history_oldest_reached'), _deviceLanguage);
+      return;
+    }
+
+    setState(() => _index = newIndex);
+    final cue = delta > 0
+        ? _loc.translate('history_older')
+        : _loc.translate('history_newer');
+    await _tts.speak(cue, _deviceLanguage);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final history = ref.watch(conversationProvider).history;
+    final isEmpty = history.isEmpty;
 
     return Scaffold(
       backgroundColor: Colors.black,
       extendBodyBehindAppBar: true,
       appBar: AppBar(
-        title: Text(
+        title: const Text(
           'HISTORY',
-          style: const TextStyle(
+          style: TextStyle(
             fontSize: 16,
             letterSpacing: 4,
             fontWeight: FontWeight.w300,
@@ -34,326 +156,232 @@ class HistoryScreen extends ConsumerWidget {
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh_rounded, color: Colors.white70, size: 22),
-            onPressed: () => ref.read(conversationProvider.notifier).initialize(),
+            onPressed: () {
+              _stop();
+              ref.read(conversationProvider.notifier).initialize(skipWelcome: true);
+              Future.delayed(const Duration(milliseconds: 400), _announceCount);
+            },
           ),
           const SizedBox(width: 8),
         ],
         leading: IconButton(
           icon: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white, size: 20),
-          onPressed: () => Navigator.pop(context),
+          onPressed: () {
+            _stop();
+            Navigator.pop(context);
+          },
         ),
       ),
       body: Stack(
         children: [
-          // Background Gradient
+          // Background gradient
           Positioned.fill(
             child: Container(
               decoration: const BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
-                  colors: [
-                    Color(0xFF1A1A1A),
-                    Colors.black,
-                  ],
+                  colors: [Color(0xFF1A1A1A), Colors.black],
                 ),
               ),
             ),
           ),
 
-          // History List
-          SafeArea(
-            child: history.isEmpty
-                ? Center(
-                    child: Text(
-                      'No history yet',
-                      style: TextStyle(color: Colors.white.withValues(alpha: 0.3), fontSize: 16),
+          if (isEmpty)
+            Center(
+              child: Text(
+                _loc.translate('history_empty'),
+                style: TextStyle(color: Colors.white.withValues(alpha: 0.3), fontSize: 16),
+              ),
+            )
+          else
+            SafeArea(
+              child: Column(
+                children: [
+                  const SizedBox(height: 24),
+
+                  // Entry counter
+                  Text(
+                    '${_index + 1} / ${history.length}',
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.3),
+                      fontSize: 12,
+                      letterSpacing: 3,
                     ),
-                  )
-                : ListView.builder(
-                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
-                    physics: const BouncingScrollPhysics(),
-                    itemCount: history.length,
-                    itemBuilder: (context, index) {
-                      final turn = history[index];
-                      return _HistoryCard(turn: turn);
-                    },
                   ),
-          ),
+
+                  const SizedBox(height: 8),
+
+                  // Progress bar
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 40),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(2),
+                      child: LinearProgressIndicator(
+                        value: history.isEmpty ? 0 : (_index + 1) / history.length,
+                        backgroundColor: Colors.white12,
+                        valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF6C8EFF)),
+                        minHeight: 2,
+                      ),
+                    ),
+                  ),
+
+                  const Spacer(),
+
+                  // Wave visualiser
+                  SizedBox(
+                    height: 60,
+                    child: AnimatedBuilder(
+                      animation: _waveController,
+                      builder: (context, child) => _buildWave(_waveController.value),
+                    ),
+                  ),
+
+                  const SizedBox(height: 48),
+
+                  // Navigation row: older ← [play] → newer
+                  // Index 0 = newest, higher = older
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 32),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        // Newer (decrease index)
+                        _CircleButton(
+                          icon: Icons.skip_previous_rounded,
+                          size: 56,
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            _navigate(-1);
+                          },
+                        ),
+
+                        // Play / Stop
+                        _CircleButton(
+                          icon: _isPlaying ? Icons.stop_rounded : Icons.play_arrow_rounded,
+                          size: 80,
+                          primary: true,
+                          onTap: () {
+                            HapticFeedback.mediumImpact();
+                            if (_isPlaying) {
+                              _stop();
+                            } else {
+                              _playCurrentTurn();
+                            }
+                          },
+                        ),
+
+                        // Older (increase index)
+                        _CircleButton(
+                          icon: Icons.skip_next_rounded,
+                          size: 56,
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            _navigate(1);
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 40),
+
+                  // Subtle date label
+                  Text(
+                    _formatDate(history[_index].timestamp),
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.25),
+                      fontSize: 11,
+                      letterSpacing: 2,
+                    ),
+                  ),
+
+                  const Spacer(),
+                ],
+              ),
+            ),
         ],
       ),
     );
   }
-}
 
-class _HistoryCard extends ConsumerWidget {
-  final ConversationTurn turn;
-
-  const _HistoryCard({required this.turn});
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final dateStr = DateFormat('MMM d, h:mm a').format(turn.timestamp);
-
-    final bool isNetworkImage = turn.imagePath?.startsWith('http') ?? false;
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 20),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(24),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-          child: Container(
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.06),
-              borderRadius: BorderRadius.circular(24),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      dateStr.toUpperCase(),
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.3),
-                        fontSize: 10,
-                        letterSpacing: 1.5,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const Icon(Icons.history_toggle_off_rounded, color: Colors.white24, size: 16),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                
-                // Image Handling (Network or File)
-                if (turn.imagePath != null)
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 16),
-                    width: double.infinity,
-                    height: 220,
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(18),
-                      border: Border.all(color: Colors.white12),
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(18),
-                      child: isNetworkImage 
-                        ? Image.network(
-                            turn.imagePath!,
-                            fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) => _ImageError(),
-                          )
-                        : Image.file(
-                            File(turn.imagePath!),
-                            fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) => _ImageError(),
-                          ),
-                    ),
-                  ),
-
-                // Voice Note players instead of text
-                _VoicePlayerBubble(
-                  text: turn.query,
-                  language: turn.language,
-                  isUser: true,
-                ),
-                const SizedBox(height: 12),
-                _VoicePlayerBubble(
-                  text: turn.response,
-                  language: turn.language,
-                  isUser: false,
-                ),
-              ],
-            ),
+  Widget _buildWave(double t) {
+    final heights = [12.0, 20.0, 14.0, 28.0, 18.0, 10.0, 24.0, 16.0, 22.0, 12.0, 18.0];
+    final bars = <Widget>[];
+    for (int i = 0; i < heights.length; i++) {
+      final base = heights[i];
+      final animated = _isPlaying
+          ? base * 0.3 + base * 1.2 * (0.5 + 0.5 * _waveSample(t, i))
+          : base * 0.4;
+      bars.add(
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 80),
+          width: 4,
+          height: animated,
+          margin: const EdgeInsets.symmetric(horizontal: 2.5),
+          decoration: BoxDecoration(
+            color: _isPlaying
+                ? const Color(0xFF6C8EFF).withValues(alpha: 0.85)
+                : Colors.white.withValues(alpha: 0.15),
+            borderRadius: BorderRadius.circular(3),
           ),
         ),
-      ),
-    );
+      );
+    }
+    return Row(mainAxisAlignment: MainAxisAlignment.center, children: bars);
+  }
+
+  double _waveSample(double t, int i) {
+    return (math.sin(t * math.pi * 2 + i * 0.7) + 1) / 2;
+  }
+
+  String _formatDate(DateTime dt) {
+    final months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+    final h = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
+    final m = dt.minute.toString().padLeft(2, '0');
+    final ampm = dt.hour < 12 ? 'AM' : 'PM';
+    return '${months[dt.month - 1]} ${dt.day}  ·  $h:$m $ampm';
   }
 }
 
-class _ImageError extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      color: Colors.white.withValues(alpha: 0.05),
-      child: const Icon(Icons.broken_image_rounded, color: Colors.white24, size: 30),
-    );
-  }
-}
+class _CircleButton extends StatelessWidget {
+  final IconData icon;
+  final double size;
+  final bool primary;
+  final VoidCallback onTap;
 
-class _VoicePlayerBubble extends ConsumerStatefulWidget {
-  final String text;
-  final String language; // BCP-47 e.g. 'hi-IN'
-  final bool isUser;
-
-  const _VoicePlayerBubble({
-    required this.text,
-    required this.language,
-    required this.isUser,
+  const _CircleButton({
+    required this.icon,
+    required this.size,
+    required this.onTap,
+    this.primary = false,
   });
 
   @override
-  ConsumerState<_VoicePlayerBubble> createState() => _VoicePlayerBubbleState();
-}
-
-class _VoicePlayerBubbleState extends ConsumerState<_VoicePlayerBubble> {
-  bool _isPlaying = false;
-
-  @override
   Widget build(BuildContext context) {
-    final notifier = ref.read(conversationProvider.notifier);
-    
-    return InkWell(
-      onTap: () async {
-        if (_isPlaying) {
-          notifier.stopSpeaking();
-          setState(() => _isPlaying = false);
-        } else {
-          setState(() => _isPlaying = true);
-          await notifier.speak(widget.text, Language.fromBcp47(widget.language));
-          if (mounted) setState(() => _isPlaying = false);
-        }
-      },
-      borderRadius: BorderRadius.circular(16),
+    return GestureDetector(
+      onTap: onTap,
       child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        width: size,
+        height: size,
         decoration: BoxDecoration(
-          color: widget.isUser ? Colors.blueAccent.withValues(alpha: 0.12) : Colors.greenAccent.withValues(alpha: 0.08),
-          borderRadius: BorderRadius.circular(16),
+          shape: BoxShape.circle,
+          color: primary
+              ? const Color(0xFF6C8EFF).withValues(alpha: 0.18)
+              : Colors.white.withValues(alpha: 0.07),
           border: Border.all(
-            color: widget.isUser ? Colors.blueAccent.withValues(alpha: 0.3) : Colors.greenAccent.withValues(alpha: 0.2),
-            width: 1,
+            color: primary
+                ? const Color(0xFF6C8EFF).withValues(alpha: 0.5)
+                : Colors.white.withValues(alpha: 0.15),
+            width: primary ? 1.5 : 1,
           ),
         ),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: widget.isUser ? Colors.blueAccent.withValues(alpha: 0.2) : Colors.greenAccent.withValues(alpha: 0.2),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(
-                _isPlaying ? Icons.stop_rounded : Icons.play_arrow_rounded,
-                color: widget.isUser ? Colors.blueAccent.shade100 : Colors.greenAccent.shade100,
-                size: 22,
-              ),
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              // The fixed height prevents the bounding box from jumping up and down during the animation
-              child: SizedBox(
-                height: 24,
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    _WaveLine(isAnimating: _isPlaying, height: 12),
-                    const SizedBox(width: 3),
-                    _WaveLine(isAnimating: _isPlaying, height: 16),
-                    const SizedBox(width: 3),
-                    _WaveLine(isAnimating: _isPlaying, height: 10),
-                    const SizedBox(width: 3),
-                    _WaveLine(isAnimating: _isPlaying, height: 18),
-                    const SizedBox(width: 3),
-                    _WaveLine(isAnimating: _isPlaying, height: 14),
-                    const SizedBox(width: 3),
-                    _WaveLine(isAnimating: _isPlaying, height: 8),
-                    const SizedBox(width: 3),
-                    _WaveLine(isAnimating: _isPlaying, height: 16),
-                    const SizedBox(width: 3),
-                    _WaveLine(isAnimating: _isPlaying, height: 12),
-                    const SizedBox(width: 3),
-                    _WaveLine(isAnimating: _isPlaying, height: 18),
-                  ],
-                ),
-              ),
-            ),
-            Icon(
-              widget.isUser ? Icons.person_outline_rounded : Icons.smart_toy_outlined,
-              color: widget.isUser ? Colors.blueAccent.withValues(alpha: 0.4) : Colors.greenAccent.withValues(alpha: 0.3),
-              size: 24,
-            ),
-          ],
+        child: Icon(
+          icon,
+          color: primary ? const Color(0xFF6C8EFF) : Colors.white60,
+          size: size * 0.45,
         ),
       ),
-    );
-  }
-}
-
-class _WaveLine extends StatefulWidget {
-  final bool isAnimating;
-  final double height;
-  
-  const _WaveLine({required this.isAnimating, required this.height});
-
-  @override
-  State<_WaveLine> createState() => _WaveLineState();
-}
-
-class _WaveLineState extends State<_WaveLine> with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-  late Animation<double> _animation;
-
-  @override
-  void initState() {
-    super.initState();
-    // Offset the duration slightly based on the initial height to create an organic, non-uniform wave effect
-    final speed = 300 + (widget.height * 15).toInt();
-    _controller = AnimationController(
-      vsync: this, 
-      duration: Duration(milliseconds: speed)
-    );
-    
-    _animation = Tween<double>(begin: widget.height * 0.3, end: widget.height * 1.5).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeInOutSine)
-    );
-    
-    if (widget.isAnimating) {
-      _controller.repeat(reverse: true);
-    }
-  }
-
-  @override
-  void didUpdateWidget(_WaveLine oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.isAnimating != oldWidget.isAnimating) {
-      if (widget.isAnimating) {
-        _controller.repeat(reverse: true);
-      } else {
-        _controller.stop();
-        _controller.animateTo(0.0); // Reset exactly where we started smoothly
-      }
-    }
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _animation,
-      builder: (context, child) {
-        return Container(
-          width: 3,
-          height: widget.isAnimating ? _animation.value : widget.height * 0.7,
-          margin: const EdgeInsets.symmetric(horizontal: 1.5),
-          decoration: BoxDecoration(
-            color: widget.isAnimating ? Colors.white : Colors.white24,
-            borderRadius: BorderRadius.circular(2),
-          ),
-        );
-      },
     );
   }
 }

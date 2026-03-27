@@ -14,6 +14,7 @@ import '../services/tts_service.dart';
 import '../services/backend_service.dart';
 import '../services/azure_speech_service.dart';
 import '../services/barcode_service.dart';
+import '../services/sound_service.dart';
 import '../utils/image_utils.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'settings_provider.dart';
@@ -26,12 +27,14 @@ class ConversationState {
   final String lastResponse;
   final List<ConversationTurn> history;
   final bool isFlashOn;
+  final bool isCameraActive;
 
   const ConversationState({
     this.status = AppState.idle,
     this.lastResponse = '',
     this.history = const [],
     this.isFlashOn = false,
+    this.isCameraActive = true,
   });
 
   ConversationState copyWith({
@@ -39,12 +42,14 @@ class ConversationState {
     String? lastResponse,
     List<ConversationTurn>? history,
     bool? isFlashOn,
+    bool? isCameraActive,
   }) {
     return ConversationState(
       status: status ?? this.status,
       lastResponse: lastResponse ?? this.lastResponse,
       history: history ?? this.history,
       isFlashOn: isFlashOn ?? this.isFlashOn,
+      isCameraActive: isCameraActive ?? this.isCameraActive,
     );
   }
 }
@@ -62,8 +67,10 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
   final TTSService _ttsService = TTSService();
   final BackendService _backendService = BackendService();
   final BarcodeService _barcodeService = BarcodeService();
+  final SoundService _soundService = SoundService();
 
   String? _recordingPath;
+  Future<_CaptureResult>? _captureTask;
   Language _detectedLanguage = Language.english;
   String _currentSessionId = 'default';
 
@@ -71,7 +78,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
 
   CameraService get cameraService => _cameraService;
 
-  Future<void> initialize() async {
+  Future<void> initialize({bool skipWelcome = false}) async {
     try {
       final deviceId = await _getDeviceId();
       _currentSessionId = '${deviceId}_${DateTime.now().millisecondsSinceEpoch}';
@@ -90,6 +97,9 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       } catch (e) {
         debugPrint('[Init] History load failed (non-fatal): $e');
       }
+
+      // Pre-write chime WAV files to disk so first play has no delay
+      _soundService.initialize().ignore();
 
       final cameraStatus = await Permission.camera.request();
       final micStatus = await Permission.microphone.request();
@@ -116,12 +126,14 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
         return;
       }
 
-      final settings = _ref.read(settingsProvider);
-      if (settings.tutorialCompleted) {
-        final language = _deviceLanguage();
-        final localizations = AppLocalizations(language);
-        await _ttsService.speak(
-            localizations.translate('welcome_message'), language);
+      if (!skipWelcome) {
+        final settings = _ref.read(settingsProvider);
+        if (settings.tutorialCompleted) {
+          final language = _deviceLanguage();
+          final localizations = AppLocalizations(language);
+          await _ttsService.speak(
+              localizations.translate('welcome_message'), language);
+        }
       }
 
       state = state.copyWith();
@@ -141,6 +153,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
         final directory = await getTemporaryDirectory();
         _recordingPath = p.join(directory.path, 'audio_capture.wav');
 
+        await _soundService.playListening();
         state = state.copyWith(status: AppState.listening);
 
         await _recorder.start(
@@ -151,6 +164,11 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
           ),
           path: _recordingPath!,
         );
+
+        // Capture image immediately on press — only if camera is active
+        if (state.isCameraActive) {
+          _captureTask = _captureAndCompress();
+        }
       }
     } catch (e) {
       debugPrint('[Mic] Start error: $e');
@@ -164,20 +182,29 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       state = state.copyWith(status: AppState.idle);
       return;
     }
+    await _soundService.playThinking();
     state = state.copyWith(status: AppState.thinking);
 
     try {
-      // Parallel: capture+compress image AND transcribe audio
-      final captureTask = _captureAndCompress();
+      // Await the image captured on press; null if camera was off at press time
+      final pendingCapture = _captureTask ?? Future.value(const _CaptureResult(file: null, barcode: null));
+      _captureTask = null;
       final sttTask = _azureSpeechService.recognize(path);
-      final captureResult = await captureTask;
+      final captureResult = await pendingCapture;
       final sttResult = await sttTask;
       final compressedFile = captureResult.file;
       final barcode = captureResult.barcode;
+      debugPrint('[Provider] Capture done — image=${compressedFile != null} barcode=${barcode ?? "none"}');
 
       final transcript =
           sttResult.transcript.isNotEmpty ? sttResult.transcript : 'What is this?';
       _detectedLanguage = Language.fromBcp47(sttResult.language);
+
+      // Barcode confirmation — let the user know the scan worked before AI answers
+      if (barcode != null) {
+        final confirmation = AppLocalizations(_detectedLanguage).translate('barcode_found');
+        await _ttsService.speak(confirmation, _detectedLanguage);
+      }
 
       final deviceId = await _getDeviceId();
       final settings = _ref.read(settingsProvider);
@@ -197,10 +224,12 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
         }
       };
 
-      void flushSentence(String sentence) {
+      Future<void> flushSentence(String sentence) async {
         if (sentence.isEmpty) return;
         if (!speakingStarted) {
           speakingStarted = true;
+          // Await the chime so TTS doesn't steal audio focus before it finishes
+          await _soundService.playSpeaking();
           state = state.copyWith(status: AppState.speaking);
         }
         _ttsService.speakStreaming(sentence, _detectedLanguage).ignore();
@@ -223,7 +252,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
         final text = sentenceBuffer.toString();
         final match = sentenceBoundary.firstMatch(text);
         if (match != null) {
-          flushSentence(text.substring(0, match.end).trim());
+          await flushSentence(text.substring(0, match.end).trim());
           sentenceBuffer
             ..clear()
             ..write(text.substring(match.end));
@@ -231,7 +260,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
       }
 
       // Flush any remaining text after stream ends
-      flushSentence(sentenceBuffer.toString().trim());
+      await flushSentence(sentenceBuffer.toString().trim());
       streamingDone = true;
 
       // Add to history
@@ -240,7 +269,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
         query: transcript,
         response: responseText,
         timestamp: DateTime.now(),
-        imagePath: null,
+        imagePath: captureResult.file?.path,
         language: sttResult.language,
       );
       state = state.copyWith(
@@ -282,14 +311,22 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
   /// Returns null if the camera is unavailable (non-fatal — backend handles
   /// null image gracefully).
   Future<_CaptureResult> _captureAndCompress() async {
+    debugPrint('[Capture] Starting captureAndCompress...');
     try {
       final xFile = await _cameraService.captureFrame();
-      if (xFile == null) return const _CaptureResult(file: null, barcode: null);
+      debugPrint('[Capture] captureFrame result: ${xFile?.path ?? "NULL"}');
+      if (xFile == null) {
+        debugPrint('[Capture] xFile is null — skipping barcode scan');
+        return const _CaptureResult(file: null, barcode: null);
+      }
+      debugPrint('[Capture] Calling barcode scan on ${xFile.path}');
       final barcode = await _barcodeService.scanImagePath(xFile.path);
+      debugPrint('[Capture] Barcode scan result: ${barcode ?? "none"}');
       final compressed = await ImageUtils.compressImage(xFile.path);
+      debugPrint('[Capture] Compressed image: ${compressed.path}');
       return _CaptureResult(file: compressed, barcode: barcode);
-    } catch (e) {
-      debugPrint('[Capture] Failed (non-fatal): $e');
+    } catch (e, st) {
+      debugPrint('[Capture] Failed (non-fatal): $e\n$st');
       return const _CaptureResult(file: null, barcode: null);
     }
   }
@@ -401,6 +438,10 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
     state = state.copyWith(isFlashOn: _cameraService.isFlashOn);
   }
 
+  void toggleCameraActive() {
+    state = state.copyWith(isCameraActive: !state.isCameraActive);
+  }
+
   Future<String> _getDeviceId() async {
     final prefs = await SharedPreferences.getInstance();
     String? id = prefs.getString('device_id');
@@ -426,6 +467,7 @@ class ConversationNotifier extends StateNotifier<ConversationState> {
     unawaited(_cameraService.dispose());
     unawaited(_barcodeService.dispose());
     _recorder.dispose();
+    _soundService.dispose();
     super.dispose();
   }
 }
